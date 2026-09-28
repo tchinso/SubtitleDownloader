@@ -39,6 +39,7 @@ class Candidate:
     note: str = ""
     file_id: int | None = None
     page_title: str = ""
+    require_episode: bool = False
 
     @property
     def key(self) -> str:
@@ -50,7 +51,6 @@ class SearchResult:
     candidates: list[Candidate] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     status: str = "empty"  # found, empty, error, review
-    fallback_used: bool = False
 
     def add(self, other: "SearchResult") -> None:
         keys = {c.key for c in self.candidates}

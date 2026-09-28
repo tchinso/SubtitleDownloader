@@ -9,8 +9,9 @@ import re
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit
 
 from ..htmlparse import Document
-from ..matching import (FORMATS, ARCHIVES, drive_id, episode_of, file_name_from_url,
-                        matching_post, normal, season_of, suitable_file)
+from ..matching import (drive_id, episode_of, episode_range, file_name_from_url,
+                        is_special, matching_post, matching_public_title, normal, season_of, suitable_file,
+                        title_queries, without_mixed_specials)
 from ..models import Anime, AnimeSearchResult, Candidate, Query, SearchResult
 from ..network import HttpClient, SourceError, allowed_url
 
@@ -40,6 +41,15 @@ def _decode_js_string(value: str) -> str:
             return chr(int(item[1:], 16))
         return replacements.get(item, item)
     return re.sub(r"\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[nrt'\"\\/])", replace, value)
+
+
+def _post_confidence(title: str, aliases: list[str], query: Query) -> str:
+    explicit = matching_post(title, aliases, query.season, query.episode)
+    if explicit != "none":
+        return explicit
+    # Whole-series posts may contain a numbered attachment; keep those for review.
+    return ("review" if matching_public_title(title, aliases, query.season,
+                                               query.episode) != "none" else "none")
 
 
 class ReAnime:
@@ -140,18 +150,18 @@ class ReAnime:
         if self._catalog is not None:
             return self._catalog
         first = self.http.get_json("https://api.anissia.net/anime/list/0")
+        if first.get("code", "ok") != "ok":
+            raise SourceError("애니시아 작품 목록 응답 오류")
         data = first.get("data") or {}
         pages = data.get("totalPages", 1)
-        if not isinstance(pages, int) or not 1 <= pages <= 200:
+        if not isinstance(pages, int) or not 1 <= pages <= 200 or not isinstance(data.get("content"), list):
             raise SourceError("애니시아 목록 페이지 범위를 확인할 수 없음")
         items = list(data.get("content") or [])
         for page in range(1, pages):
-            try:
-                res = self.http.get_json(f"https://api.anissia.net/anime/list/{page}")
-                items.extend((res.get("data") or {}).get("content") or [])
-            except SourceError as exc:
-                warnings.append(f"애니시아 전체 목록 {page}페이지: {exc}")
-                break
+            res = self.http.get_json(f"https://api.anissia.net/anime/list/{page}")
+            if res.get("code", "ok") != "ok" or not isinstance((res.get("data") or {}).get("content"), list):
+                raise SourceError(f"애니시아 전체 목록 {page}페이지 응답 오류")
+            items.extend(res["data"]["content"])
         self._catalog = items
         return items
 
@@ -161,8 +171,11 @@ class ReAnime:
             try:
                 params = urlencode({"q": re.sub(r"(?:season|시즌)\s*\d+", "", name, flags=re.I).strip()})
                 data = self.http.get_json(f"https://api.anissia.net/anime/list/0?{params}")
+                if data.get("code", "ok") != "ok" or not isinstance((data.get("data") or {}).get("content"), list):
+                    raise SourceError("애니시아 작품 검색 응답 오류")
                 for item in (data.get("data") or {}).get("content") or []:
-                    collected[item.get("animeNo")] = item
+                    if isinstance(item, dict) and isinstance(item.get("animeNo"), int):
+                        collected[item["animeNo"]] = item
             except (SourceError, AttributeError) as exc:
                 warnings.append(f"애니시아 작품 검색: {exc}")
         ranked = self._rank(collected.values(), names, season)
@@ -188,6 +201,8 @@ class ReAnime:
             close = any(len(n) >= 4 and (n in v or v in n) and len(v) >= 4 for n in wanted for v in values)
             if exact or close:
                 scored.append((0 if exact else 1, item))
+        if any(score == 0 for score, _ in scored):
+            scored = [(score, item) for score, item in scored if score == 0]
         return [item for _, item in sorted(scored, key=lambda p: p[0])]
 
     def _candidates_from_naver_post(self, url: str, aliases: list[str], query: Query, creator: str):
@@ -200,7 +215,7 @@ class ReAnime:
                 doc = Document(html)
                 break
         title = doc.meta.get("og:title", "")
-        confidence = matching_post(title, aliases, query.season, query.episode)
+        confidence = _post_confidence(title, aliases, query)
         if confidence == "none":
             return []
         files = []
@@ -219,14 +234,18 @@ class ReAnime:
                 files.append((link.download or link.text or file_name_from_url(link.href), link.href))
         candidates = []
         for name, link in dict.fromkeys(files):
-            if not allowed_url(link) or _host(link) not in ("download.blog.naver.com", "blogfiles.pstatic.net") or not suitable_file(name, query.episode):
+            if (not allowed_url(link) or _host(link) not in ("download.blog.naver.com", "blogfiles.pstatic.net")
+                    or not suitable_file(name, query.episode)
+                    or (not is_special(query.title) and is_special(without_mixed_specials(name)))):
                 continue
             candidates.append(Candidate("ReAnime/네이버", title, name, url, link,
                                         season=query.season or season_of(title), episode=query.episode or episode_of(title),
-                                        creator=creator, confidence=confidence, page_title=title))
+                                        creator=creator, confidence=confidence, page_title=title,
+                                        require_episode=confidence != "exact"))
         return candidates
 
-    def _naver(self, source: str, aliases: list[str], query: Query, creator: str):
+    def _naver(self, source: str, aliases: list[str], query: Query, creator: str,
+               search_terms: list[str] | None = None):
         canonical = _naver_url(source)
         if not canonical:
             return []
@@ -237,7 +256,7 @@ class ReAnime:
         if result:
             return result
         blog_id = urlsplit(canonical).path.strip("/").split("/")[0]
-        for alias in aliases[:3]:
+        for alias in (search_terms or aliases)[:6]:
             base = "https://blog.naver.com/PostSearchList.naver?" + urlencode({"blogId": blog_id, "SearchText": alias})
             queue = [base]
             visited = set()
@@ -251,7 +270,7 @@ class ReAnime:
                 for link in doc.links:
                     target = urljoin(url, link.href)
                     post = _naver_url(target)
-                    if post and urlsplit(post).path.strip("/").split("/")[0] == blog_id and matching_post(link.text, aliases, query.season, query.episode) != "none":
+                    if post and urlsplit(post).path.strip("/").split("/")[0] == blog_id and _post_confidence(link.text, aliases, query) != "none":
                         posts.append(post)
                     parsed = urlsplit(target)
                     if parsed.hostname == "blog.naver.com" and parsed.path == "/PostSearchList.naver" and target not in visited and len(queue) < 4:
@@ -268,7 +287,7 @@ class ReAnime:
         html = self.http.get_text(url)
         doc = Document(html)
         title = doc.meta.get("og:title", "")
-        confidence = matching_post(title, aliases, query.season, query.episode)
+        confidence = _post_confidence(title, aliases, query)
         if confidence == "none":
             return []
         result = []
@@ -277,13 +296,16 @@ class ReAnime:
             if _host(file_url) != "blog.kakaocdn.net":
                 continue
             name = file_name_from_url(file_url)
-            if suitable_file(name, query.episode):
+            if (suitable_file(name, query.episode)
+                    and (is_special(query.title) or not is_special(without_mixed_specials(name)))):
                 result.append(Candidate("ReAnime/티스토리", title, name, url, file_url,
                                         season=query.season or season_of(title), episode=query.episode or episode_of(title),
-                                        creator=creator, confidence=confidence, page_title=title))
+                                        creator=creator, confidence=confidence, page_title=title,
+                                        require_episode=confidence != "exact"))
         return result
 
-    def _tistory(self, source: str, aliases: list[str], query: Query, creator: str):
+    def _tistory(self, source: str, aliases: list[str], query: Query, creator: str,
+                 search_terms: list[str] | None = None):
         parsed = urlsplit(source)
         origin = f"https://{parsed.hostname}"
         if re.fullmatch(r"/(?:\d+|entry/[^/]+)/?", parsed.path):
@@ -293,7 +315,7 @@ class ReAnime:
                 result = []
             if result:
                 return result
-        for alias in aliases[:3]:
+        for alias in (search_terms or aliases)[:6]:
             base = f"{origin}/search/{quote(alias, safe='')}"
             queue = [base]
             visited = set()
@@ -310,7 +332,11 @@ class ReAnime:
                     path = urlsplit(target).path
                     if _host(target) != parsed.hostname:
                         continue
-                    if re.fullmatch(r"/(?:\d+|entry/[^/]+)/?", path) and matching_post(link.text, aliases, query.season, query.episode) != "none":
+                    title = (link.attributes.get("data-tiara-copy")
+                             or link.attributes.get("data-tiara-name") or link.text)
+                    if link.attributes.get("onclick"):
+                        title = re.sub(r"^\s*\d{4}[./-]\d{1,2}[./-]\d{1,2}\s*", "", title)
+                    if re.fullmatch(r"/(?:\d+|entry/[^/]+)/?", path) and _post_confidence(title, aliases, query) != "none":
                         posts.append(target.split("#")[0])
                     if path == urlsplit(base).path and parse_qs(urlsplit(target).query).get("page") and len(queue) < 4:
                         queue.append(target)
@@ -321,7 +347,7 @@ class ReAnime:
         return []
 
     def _blogger_content(self, content: str, title: str, source: str, aliases: list[str], query: Query, creator: str):
-        confidence = matching_post(title, aliases, query.season, query.episode)
+        confidence = _post_confidence(title, aliases, query)
         if confidence == "none":
             return []
         result = []
@@ -331,19 +357,30 @@ class ReAnime:
             label = link.text or "Google Drive 자막"
             if re.search(r"폰트|서체|글꼴|fonts?|\.ttf|\.otf", label, re.I):
                 continue
+            if not is_special(query.title) and is_special(label):
+                continue
             label_season = season_of(label)
             if query.season and label_season and label_season != query.season:
                 continue
             if query.episode:
+                number_range = episode_range(label)
+                if number_range is None:
+                    found_range = re.search(r"(?:^|[\s(\[])(\d{1,3})\s*[~～〜\-–]\s*(\d{1,3})(?=\s|[)\]]|$)", label)
+                    if found_range:
+                        number_range = (int(found_range.group(1)), int(found_range.group(2)))
+                if number_range and not number_range[0] <= query.episode <= number_range[1]:
+                    continue
                 ep = episode_of(label)
-                if ep is not None and ep != query.episode:
+                if ep is not None and ep != query.episode and not number_range:
                     continue
             result.append(Candidate("ReAnime/Blogger", title, label[:100] + ".zip" if not re.search(r"\.(?:smi|srt|vtt|ass|zip|7z|rar)$", label, re.I) else label,
                                     source, link.href, season=query.season or season_of(title), episode=query.episode or episode_of(title),
-                                    creator=creator, confidence="review", note="Drive 링크의 실제 파일명은 다운로드 때 확인"))
+                                    creator=creator, confidence="review", note="Drive 링크의 실제 파일명은 다운로드 때 확인",
+                                    require_episode=True))
         return result
 
-    def _blogger(self, source: str, aliases: list[str], query: Query, creator: str):
+    def _blogger(self, source: str, aliases: list[str], query: Query, creator: str,
+                 search_terms: list[str] | None = None):
         origin = f"https://{_host(source)}"
         result = []
         if re.fullmatch(r"/\d{4}/\d{2}/[^/]+\.html", urlsplit(source).path):
@@ -355,7 +392,7 @@ class ReAnime:
                 pass
             if result:
                 return result
-        for alias in aliases[:3]:
+        for alias in (search_terms or aliases)[:6]:
             url = f"{origin}/feeds/posts/default?" + urlencode({"alt": "json", "max-results": 100, "q": alias})
             try:
                 feed = self.http.get_json(url)
@@ -376,7 +413,7 @@ class ReAnime:
                         target = urljoin(page, link.href)
                         if _host(target) != _host(origin):
                             continue
-                        if re.fullmatch(r"/\d{4}/\d{2}/[^/]+\.html", urlsplit(target).path) and matching_post(link.text, aliases, query.season, query.episode) != "none":
+                        if re.fullmatch(r"/\d{4}/\d{2}/[^/]+\.html", urlsplit(target).path) and _post_confidence(link.text, aliases, query) != "none":
                             html = self.http.get_text(target)
                             article = Document(html)
                             result.extend(self._blogger_content(html, article.meta.get("og:title", article.title), target, aliases, query, creator))
@@ -386,18 +423,19 @@ class ReAnime:
                 break
         return result
 
-    def _read_source(self, source: str, aliases: list[str], query: Query, creator: str):
+    def _read_source(self, source: str, aliases: list[str], query: Query, creator: str,
+                     search_terms: list[str] | None = None):
         source = self._https_source(source)
         host = _host(source)
         if not allowed_url(source):
-            return []
+            raise SourceError(f"{host or '알 수 없는 출처'} 자동 검색 미지원")
         if _naver_url(source):
-            return self._naver(source, aliases, query, creator)
+            return self._naver(source, aliases, query, creator, search_terms)
         if host.endswith(".tistory.com"):
-            return self._tistory(source, aliases, query, creator)
+            return self._tistory(source, aliases, query, creator, search_terms)
         if host.endswith(".blogspot.com"):
-            return self._blogger(source, aliases, query, creator)
-        return []
+            return self._blogger(source, aliases, query, creator, search_terms)
+        raise SourceError(f"{host or '알 수 없는 출처'} 자동 검색 미지원")
 
     @staticmethod
     def _https_source(url: str) -> str:
@@ -409,7 +447,7 @@ class ReAnime:
         return url
 
     def direct(self, url: str, query: Query) -> SearchResult:
-        """User-supplied post or attachment link from Edge or the desktop UI."""
+        """User-supplied post or attachment link from the desktop UI."""
         url = self._https_source(url.strip())
         result = SearchResult()
         if not allowed_url(url):
@@ -420,10 +458,12 @@ class ReAnime:
                 name = file_name_from_url(url)
                 if suitable_file(name, query.episode):
                     result.candidates.append(Candidate("직접 첨부", query.title, name, url, url,
-                                                       season=query.season, episode=query.episode))
+                                                       season=query.season, episode=query.episode,
+                                                       require_episode=True))
             elif drive_id(url):
                 result.candidates.append(Candidate("직접 Drive", query.title, "Google Drive 파일", url, url,
-                                                   season=query.season, episode=query.episode))
+                                                   season=query.season, episode=query.episode,
+                                                   require_episode=True))
             else:
                 result.candidates.extend(self._read_source(url, [query.title], query, "사용자 링크"))
         except SourceError as exc:
@@ -443,8 +483,14 @@ class ReAnime:
                     if re.search(r"captcha-form|recaptcha|/sorry/|unusual traffic", html, re.I):
                         raise SourceError("Google 자동 검색 제한. 브라우저에서 검색 후 글 주소를 앱에 붙여넣어 줘")
                     page_urls = []
-                    for link in Document(html).links:
-                        if not link.heading or matching_post(link.text, aliases, query.season, query.episode) == "none":
+                    links = Document(html).links
+                    if (not any(link.heading for link in links)
+                            and not re.search(r"did not match any documents|검색어와 일치하는 문서가 없습니다|검색결과가 없습니다", html, re.I)):
+                        raise SourceError("Google 검색 결과 형식을 읽지 못함. 브라우저에서 직접 확인해 줘")
+                    for link in links:
+                        if not link.heading or _post_confidence(
+                                re.sub(r"\s*[-|:]\s*(?:네이버 블로그|티스토리)\s*$", "", link.text),
+                                aliases, query) == "none":
                             continue
                         target = urljoin("https://www.google.com", link.href)
                         if urlsplit(target).path == "/url" and _host(target) == "www.google.com":
@@ -488,31 +534,50 @@ class ReAnime:
         for work in works:
             ident = work["animeNo"]
             subject = work.get("subject", query.title)
-            aliases = list(dict.fromkeys([subject, work.get("originalSubject", ""), *names]))
+            aliases = list(dict.fromkeys(name for name in
+                                         [subject, work.get("originalSubject", ""), *names] if name))
+            source_query = Query(subject, query.language, query.season or season_of(subject),
+                                 query.episode, query.slug)
+            search_terms = title_queries(subject, aliases)
+            if (source_query.season or 1) > 1:
+                family = re.sub(r"(?:season|시즌)\s*\d+\s*(?:기|期)?|제?\s*\d+\s*(?:기|期)",
+                                "", subject, flags=re.I).strip()
+                if family and normal(family) != normal(subject):
+                    search_terms.append(family)
             try:
                 captions = self.http.get_json(f"https://api.anissia.net/anime/caption/animeNo/{ident}")
+                if captions.get("code", "ok") != "ok" or not isinstance(captions.get("data"), list):
+                    raise SourceError("애니시아 제작자 목록 응답 오류")
             except SourceError as exc:
                 warnings.append(f"애니시아 {subject}: {exc}")
                 continue
-            for creator in (captions.get("data") or [])[:30]:
+            for creator in captions["data"][:30]:
+                if not isinstance(creator, dict):
+                    warnings.append(f"애니시아 {subject}: 제작자 항목 형식 오류")
+                    continue
                 source = creator.get("website", "")
                 if not source:
+                    warnings.append(f"{creator.get('name', '제작자')}: 원문 주소 없음")
                     continue
                 try:
-                    found.extend(self._read_source(source, aliases, query, creator.get("name", "")))
+                    found.extend(self._read_source(source, aliases, source_query,
+                                                   creator.get("name", ""), search_terms))
                 except (SourceError, ValueError) as exc:
                     warnings.append(f"{creator.get('name', '제작자')}: {exc}")
-        if not found:
-            for url in self._google(names, query, warnings):
+        if not any(candidate.confidence == "exact" for candidate in found):
+            google_query = (Query(query.title, query.language,
+                                  query.season or season_of(works[0]["subject"]), query.episode, query.slug)
+                            if len(works) == 1 else query)
+            for url in self._google(names, google_query, warnings):
                 try:
-                    found.extend(self._read_source(url, names, query, _host(url)))
+                    found.extend(self._read_source(url, names, google_query, _host(url)))
                 except (SourceError, ValueError) as exc:
                     warnings.append(f"{_host(url)}: {exc}")
-                if found:
+                if any(candidate.confidence == "exact" for candidate in found):
                     break
         unique = list({candidate.key: candidate for candidate in found}.values())
         unique.sort(key=lambda c: (c.confidence != "exact", c.provider, c.title))
-        # Failure to enrich a title is advisory; completed source searches can
-        # still establish an empty result and trigger OpenSubtitles fallback.
+        # Alias lookup is advisory; source failures make an empty result incomplete.
         return SearchResult(unique, alias_warnings + warnings,
-                            "found" if unique else "error" if warnings else "empty")
+                            ("found" if any(candidate.confidence == "exact" for candidate in unique)
+                             else "review" if unique else "error" if warnings else "empty"))

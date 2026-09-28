@@ -1,9 +1,0 @@
-{
-  "manifest_version": 3,
-  "name": "애니 자막 찾기 · 엣지 연결 (선택)",
-  "description": "현재 탭의 제목 또는 게시글 주소를 로컬 애니 자막 찾기 앱으로 보냅니다.",
-  "version": "0.1.0",
-  "permissions": ["activeTab", "storage"],
-  "host_permissions": ["http://127.0.0.1:48741/*"],
-  "action": {"default_popup": "popup.html", "default_title": "애니 자막 찾기 앱으로 보내기"}
-}

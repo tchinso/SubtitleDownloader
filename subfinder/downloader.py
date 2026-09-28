@@ -13,7 +13,8 @@ import tempfile
 from urllib.parse import parse_qs, urlencode, urlsplit
 import zipfile
 
-from .matching import ARCHIVES, FORMATS, drive_id, episode_of, file_name_from_url, suitable_file
+from .matching import (ARCHIVES, FORMATS, drive_id, file_name_from_url,
+                       filename_episode, is_special)
 from .models import Candidate, Query
 from .network import HttpClient, SourceError, allowed_url
 from .providers.opensubtitles import OpenSubtitles
@@ -52,7 +53,8 @@ def _extension(data: bytes, name: str) -> str:
     raise SourceError("지원 자막/압축 파일인지 확인할 수 없음")
 
 
-def _zip_selection(data: bytes, episode: int | None) -> tuple[bytes, str] | None:
+def _zip_selection(data: bytes, episode: int | None, allow_special: bool = False,
+                   require_episode: bool = False) -> tuple[bytes, str] | None:
     try:
         archive = zipfile.ZipFile(BytesIO(data))
         items = archive.infolist()
@@ -63,12 +65,17 @@ def _zip_selection(data: bytes, episode: int | None) -> tuple[bytes, str] | None
             if info.is_dir() or info.file_size > SINGLE_LIMIT or info.flag_bits & 1:
                 continue
             name = PurePosixPath(info.filename.replace("\\", "/")).name
-            if name and Path(name).suffix.lower() in FORMATS and suitable_file(name, episode):
+            if (name and not name.startswith(".") and "__MACOSX" not in info.filename
+                    and Path(name).suffix.lower() in FORMATS
+                    and (allow_special or not is_special(name))):
                 choices.append((info, name))
         if episode is not None:
-            exact = [(i, n) for i, n in choices if episode_of(n) == episode]
+            exact = [(i, n) for i, n in choices if filename_episode(n) == episode]
             if exact:
                 choices = exact
+            elif require_episode or not (len(choices) == 1 and filename_episode(choices[0][1]) is None
+                      and not any(c.isdigit() for c in Path(choices[0][1]).stem)):
+                return None
         if len(choices) != 1:
             return None  # Preserve original archive for manual selection.
         info, name = choices[0]
@@ -81,7 +88,8 @@ def _zip_selection(data: bytes, episode: int | None) -> tuple[bytes, str] | None
         raise SourceError("ZIP 파일을 읽지 못함") from exc
 
 
-def _seven_zip_selection(data: bytes, suffix: str, episode: int | None) -> tuple[bytes, str] | None:
+def _seven_zip_selection(data: bytes, suffix: str, episode: int | None,
+                         allow_special: bool = False, require_episode: bool = False) -> tuple[bytes, str] | None:
     binary = (shutil.which("7zz") or shutil.which("7z") or
               next((str(p) for p in (Path(r"C:\Program Files\7-Zip\7z.exe"),
                                     Path(r"C:\Program Files (x86)\7-Zip\7z.exe")) if p.exists()), None))
@@ -102,14 +110,19 @@ def _seven_zip_selection(data: bytes, suffix: str, episode: int | None) -> tuple
                 continue
             size = fields.get("Size", "")
             base = PurePosixPath(name.replace("\\", "/")).name
-            if size.isdecimal() and int(size) <= SINGLE_LIMIT and Path(base).suffix.lower() in FORMATS and suitable_file(base, episode):
+            if (size.isdecimal() and int(size) <= SINGLE_LIMIT and Path(base).suffix.lower() in FORMATS
+                    and not base.startswith(".") and "__MACOSX" not in name
+                    and (allow_special or not is_special(base))):
                 choices.append((name, base))
         if len(choices) > 256:
             raise SourceError("압축 파일 항목 수가 제한을 초과함")
         if episode is not None:
-            exact = [(name, base) for name, base in choices if episode_of(base) == episode]
+            exact = [(name, base) for name, base in choices if filename_episode(base) == episode]
             if exact:
                 choices = exact
+            elif require_episode or not (len(choices) == 1 and filename_episode(choices[0][1]) is None
+                      and not any(c.isdigit() for c in Path(choices[0][1]).stem)):
+                return None
         if len(choices) != 1:
             return None
         name, base = choices[0]
@@ -183,15 +196,21 @@ class Downloader:
             raise SourceError("빈 파일 또는 크기 제한 초과")
         suffix = _extension(data, name)
         note = ""
+        if candidate.file_id is None and query.episode is not None and suffix not in ARCHIVES:
+            file_episode = filename_episode(name)
+            if file_episode is not None and file_episode != query.episode:
+                raise SourceError("첨부 파일의 화 정보가 요청과 다름")
+        allow_special = is_special(query.title)
         if suffix == ".zip":
-            item = _zip_selection(data, query.episode)
+            item = _zip_selection(data, query.episode, allow_special, candidate.require_episode)
             if item:
                 data, name = item
                 suffix = _extension(data, name)
             else:
                 note = "압축 안에서 자막 한 개를 확정하지 못해 원본 ZIP 저장"
         elif suffix in (".7z", ".rar"):
-            item = _seven_zip_selection(data, suffix, query.episode)
+            item = _seven_zip_selection(data, suffix, query.episode, allow_special,
+                                        candidate.require_episode)
             if item:
                 data, name = item
                 suffix = _extension(data, name)

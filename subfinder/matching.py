@@ -14,11 +14,24 @@ def normal(text: str) -> str:
 
 def season_of(text: str) -> int | None:
     s = unicodedata.normalize("NFKC", text)
-    match = re.search(r"(?:\bseason\s*|시즌\s*|제\s*)(\d{1,2})\s*(?:기|期)?\b|\b(\d{1,2})\s*(?:기|期)\b", s, re.I)
+    match = re.search(r"(?:\b(?:season|시즌)\s*|[제第]\s*)?(\d{1,2})\s*(?:기|期)(?!\w)|\b(?:season|시즌)\s*(\d{1,2})\b|\b(\d{1,2})(?:st|nd|rd|th)\s+season\b", s, re.I)
     if match:
-        return int(match.group(1) or match.group(2))
+        return int(next(value for value in match.groups() if value))
     match = re.search(r"\bS(\d{1,2})[ ._-]*E\d{1,3}\b", s, re.I)
-    return int(match.group(1)) if match else None
+    if match:
+        return int(match.group(1))
+    if not re.search(r"\b(?:Part|Cour)\s*\d+\s*$", s, re.I):
+        match = re.search(r"(?:^|\s)(\d{1,2})(?:st|nd|rd|th)\s*$", s, re.I)
+        if match:
+            return int(match.group(1))
+        match = re.search(r"(?:^|\s|(?<=[가-힣ぁ-んァ-ヶ一-龯]))(VIII|VII|III|VI|IV|IX|II|V|X)(?=\s*(?:$|[:~～〜]|[-–—]\s|Part\b|Cour\b))", s)
+        if match:
+            return {"II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6,
+                    "VII": 7, "VIII": 8, "IX": 9, "X": 10}.get(match.group(1))
+        match = re.search(r"(?:^|\s)([2-9])\s*$", s)
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def episode_of(text: str) -> int | None:
@@ -39,11 +52,89 @@ def episode_range(text: str) -> tuple[int, int] | None:
     return None
 
 
+def without_mixed_specials(name: str) -> str:
+    """Treat a TV + OVA bundle as TV; individual OVA files remain special."""
+    return re.sub(r"\bTV\s*\+\s*(?:OVA|OAD|SP)(?:\s*\+\s*(?:OVA|OAD|SP))*(?=$|[^a-z])",
+                  "TV", name, flags=re.I)
+
+
+def is_special(name: str) -> bool:
+    return bool(re.search(r"(?:^|[^a-z])(?:OVA|OAD|SP|SPECIAL|CHRISTMAS|NCOP|NCED)(?=$|[^a-z])|특전|외전|특별편",
+                          name, re.I))
+
+
+def filename_episode(name: str) -> int | float | None:
+    """Find an episode marker in a subtitle filename, including bare final numbers."""
+    stem = PurePosixPath(name.replace("\\", "/")).name
+    stem = re.sub(r"\.[^.]+$", "", unicodedata.normalize("NFKC", stem))
+    stem = re.sub(r"(?:\s*\[[^\]]*\]|\s*\([^)]*\))+\s*$", "", stem).strip()
+    stem = re.sub(r"((?:^|[\s._-])\d+(?:\.\d+)?(?:화|話|회))\s*[-_]\s*[a-z][a-z0-9._-]*$", r"\1", stem, flags=re.I)
+    stem = re.sub(r"(\d)[\s._-]+(?:TV|BD|WEB)$", r"\1", stem, flags=re.I)
+    stem = re.sub(r"(\d)\s+END$", r"\1", stem, flags=re.I)
+    stem = re.sub(r"(\d)[\s._-]*(?:SubsPlease|Ohys(?:-Raws)?|NanDesuKa)$", r"\1", stem, flags=re.I)
+    number = r"(\d+(?:\.\d+)?)"
+    for pattern in (rf"S\d+E{number}",
+                    rf"(?:^|[\s._-])#\s*0*{number}(?:\s+END)?$",
+                    rf"(?:^|[\s._-])(?:EP?|제)\s*0*{number}(?:화|話|회|\b)",
+                    rf"(?:^|[\s._-])0*{number}(?:화|話|회)?(?:\s*\([^)]*\))?$"):
+        found = re.search(pattern, stem, re.I)
+        if found:
+            value = float(found.group(1))
+            return int(value) if value.is_integer() else value
+    return None
+
+
+def title_queries(subject: str, aliases=()) -> list[str]:
+    """Search full title, a safe subtitle omission, and confirmed Korean aliases."""
+    titles = [subject, *(alias for alias in aliases if isinstance(alias, str) and re.search(r"[가-힣]", alias))]
+
+    def shortened(title: str) -> str | None:
+        match = (re.match(r"^(.*?)\s+[~～〜][^~～〜]+[~～〜]\s*$", title)
+                 or re.match(r"^(.*?)\s+(?:[-–—]|:)\s+.+$", title))
+        if not match or len(normal(match.group(1))) < 3:
+            return None
+        removed = unicodedata.normalize("NFKC", title[len(match.group(1)):]).replace("~", " ").replace("～", " ").replace("〜", " ")
+        if (season_of(removed) or re.search(r"\b(?:[A-Z]|[IVX]{2,4}|OVA|OAD|SP|Part|Cour)\b|극장판|특별편", removed, re.I)):
+            return None
+        return match.group(1).strip()
+
+    queries = [subject, shortened(subject)]
+    for alias in titles[1:]:
+        queries.extend((alias, shortened(alias)))
+    return list(dict.fromkeys(query for query in queries if query))[:3]
+
+
+def _without_known_title_notes(title: str, aliases: list[str]) -> str:
+    known_titles = sorted({normal(alias) for alias in aliases if len(normal(alias)) >= 3}, key=len, reverse=True)
+
+    def remove(match):
+        note = normal(match.group(1))
+        matched = False
+        for known in known_titles:
+            if known in note:
+                note = note.replace(known, "")
+                matched = True
+        return " " if matched and (not note or re.fullmatch(r"(?:19|20)\d{2}", note)) else match.group(0)
+
+    return re.sub(r"\(([^()]*)\)", remove, title)
+
+
 def matching_post(post: str, aliases: list[str], season: int | None, episode: int | None) -> str:
     """Returns exact/review/none; preserve uncertain matches for manual review."""
     if not post or not aliases:
         return "none"
-    if season and season_of(post) and season_of(post) != season:
+    post = unicodedata.normalize("NFKC", post)
+    post = re.sub(r"^\s*\[(?:자막|Erai-raws|Ohys-Raws|SubsPlease|Moozzi2|Snow-Raws)\]\s*", "", post, flags=re.I)
+    if not any(is_special(alias) for alias in aliases) and is_special(without_mixed_specials(post)):
+        return "none"
+    prefix = re.split(r"(?:\d{1,3}\s*(?:화|話|회)|\bS\d{1,2}[ ._-]*E\d{1,3}\b|자막)", post, maxsplit=1, flags=re.I)[0]
+    mixed_seasons = re.search(r"\s+(\d+\s*기(?:\s*/\s*\d+\s*기)+)\s*$", prefix)
+    if mixed_seasons and season and season in [int(number) for number in re.findall(r"\d+", mixed_seasons.group(1))]:
+        prefix = prefix[:mixed_seasons.start()] + f" {season}기"
+        post_season = season
+    else:
+        post_season = season_of(post)
+    if season and post_season and post_season != season:
         return "none"
     if episode:
         numbers = episode_range(post)
@@ -52,8 +143,9 @@ def matching_post(post: str, aliases: list[str], season: int | None, episode: in
         found = episode_of(post)
         if found is not None and found != episode and not numbers:
             return "none"
-    prefix = re.split(r"(?:\d{1,3}\s*(?:화|話|회)|\bS\d{1,2}[ ._-]*E\d{1,3}\b|자막)", post, maxsplit=1, flags=re.I)[0]
-    title = normal(prefix) or normal(post)
+        if found is None and numbers is None:
+            return "none"
+    title = normal(_without_known_title_notes(prefix, aliases)) or normal(post)
     names = [normal(name) for name in aliases if len(normal(name)) >= 2]
     if not any(name == title or (len(name) >= 4 and name in title) for name in names):
         return "none"
@@ -62,13 +154,41 @@ def matching_post(post: str, aliases: list[str], season: int | None, episode: in
     return "review"
 
 
+def matching_public_title(post: str, aliases: list[str], season: int | None,
+                          episode: int | None) -> str:
+    """Match a public aggregate post whose title may omit an episode number."""
+    explicit = matching_post(post, aliases, season, episode)
+    if explicit != "none":
+        return explicit
+    if not post or not aliases or episode_of(post) is not None or episode_range(post) is not None:
+        return "none"
+    title = unicodedata.normalize("NFKC", without_mixed_specials(post))
+    if not is_special(aliases[0]) and is_special(title):
+        return "none"
+    title = re.sub(r"^\s*\[(?:자막|Erai-raws|Ohys-Raws|SubsPlease|Moozzi2|Snow-Raws)\]\s*", "", title, flags=re.I)
+    title = re.sub(r"[\[(](?:BD(?:Rip)?|WEB(?:Rip)?|DVD)?\s*(?:\d{3,4}p|\d{3,4}x\d{3,4})(?:\s+(?:x\.?26[45]|h\.?26[45]|FLAC|AAC|10bit|8bit))*[\])]", "", title, flags=re.I)
+    title = title.split("자막", 1)[0]
+    title = re.sub(r"(?:[\s-]*(?:BD|TV|블루레이|전체|통합|완결|한글|한국어)\s*)+$", "", title, flags=re.I).strip()
+    title = _without_known_title_notes(title, aliases)
+    title = re.sub(r"\s+", " ", title).strip()
+    if not title:
+        return "none"
+    target_season = season or season_of(aliases[0]) or 1
+    if (season_of(title) or 1) != target_season:
+        return "none"
+    normalized = normal(title)
+    if normalized == normal(aliases[0]):
+        return "exact"
+    return "review" if any(normalized == normal(alias) for alias in aliases[1:]) else "none"
+
+
 def suitable_file(name: str, episode: int | None) -> bool:
     suffix = PurePosixPath(name.replace("\\", "/")).suffix.lower()
     if suffix not in FORMATS | ARCHIVES:
         return False
     if episode is None or suffix in ARCHIVES:
         return True
-    number = episode_of(name)
+    number = filename_episode(name)
     return number is None or number == episode
 
 

@@ -12,6 +12,11 @@ class SourceError(Exception):
     pass
 
 
+def _request_url(url: str) -> str:
+    """urllib requires ASCII URLs; source pages may have Korean path segments."""
+    return urllib.parse.quote(url, safe=":/?#[]@!$&'()*+,;=%")
+
+
 EXACT_HOSTS = {
     "reanime.to", "api.anissia.net", "graphql.anilist.co", "www.wikidata.org",
     "www.google.com", "blog.naver.com", "m.blog.naver.com",
@@ -42,6 +47,7 @@ class Response:
 
 class RestrictedRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        newurl = _request_url(newurl)
         if not allowed_url(newurl):
             raise SourceError("허용되지 않은 주소로 이동하려 해서 요청을 중단함")
         # Never forward an API key or authorization token to a different host.
@@ -61,6 +67,7 @@ class HttpClient:
               headers: dict | None = None, limit: int = 6 * 1024 * 1024) -> Response:
         if not allowed_url(url):
             raise SourceError("지원하는 HTTPS 출처가 아님")
+        url = _request_url(url)
         request_headers = {"User-Agent": "SubtitleFinder v0.1.0", "Accept": "*/*"}
         request_headers.update(headers or {})
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None

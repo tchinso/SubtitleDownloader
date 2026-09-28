@@ -1,18 +1,14 @@
-import json
 from pathlib import Path
-from queue import Queue
 import tempfile
 import unittest
-from urllib.request import Request, urlopen
 from unittest.mock import Mock
 import zipfile
 from io import BytesIO
 
-from subfinder.bridge import BridgeServer
 from subfinder.downloader import Downloader, safe_name
 from subfinder.engine import SearchEngine
 from subfinder.models import Anime, Candidate, Query, SearchResult
-from subfinder.network import Response, SourceError, allowed_url
+from subfinder.network import Response, SourceError, _request_url, allowed_url
 from subfinder.providers.opensubtitles import OpenSubtitles
 from subfinder.providers.reanime import ReAnime
 
@@ -59,14 +55,14 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(len(result.candidates), 1)
         second.search.assert_not_called()
 
-    def test_missing_reanime_automatically_searches_open(self):
+    def test_missing_reanime_does_not_search_open_without_user_action(self):
         first = Mock(search=Mock(return_value=SearchResult(status="empty")))
         second = Mock(search=Mock(return_value=SearchResult([Candidate("OpenSubtitles", "Example", "01.srt", "https://www.opensubtitles.com", file_id=55)], status="found")))
         result = SearchEngine(first, second).search(Query("Example", episode=1))
-        self.assertTrue(result.fallback_used)
-        second.search.assert_called_once()
+        self.assertEqual(result.status, "empty")
+        second.search.assert_not_called()
 
-    def test_selected_anime_empty_search_falls_back_with_selected_title(self):
+    def test_selected_anime_empty_search_stays_with_reanime(self):
         anime = Anime(12, "외톨이의 이세계 공략")
         first = Mock(search_selected=Mock(return_value=SearchResult(status="empty")))
         second = Mock(search=Mock(return_value=SearchResult(status="empty")))
@@ -75,8 +71,8 @@ class FlowTests(unittest.TestCase):
         result = SearchEngine(first, second).search_selected(query, anime)
 
         first.search_selected.assert_called_once_with(query, anime)
-        second.search.assert_called_once_with(query)
-        self.assertTrue(result.fallback_used)
+        second.search.assert_not_called()
+        self.assertEqual(result.status, "empty")
 
     def test_error_is_not_misreported_as_absent_and_manual_search_works(self):
         first = Mock(search=Mock(return_value=SearchResult(status="error", warnings=["HTTP 403"])))
@@ -156,18 +152,80 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(result.candidates[0].title, "외톨이의 이세계 공략 01화 자막")
         self.assertEqual([url for kind, url, _ in http.calls if kind == "json"], [captions])
 
-    def test_optional_title_lookup_failure_does_not_block_open_fallback(self):
+    def test_registered_naver_post_with_subtitle_tag_keeps_requested_episode(self):
+        http = FakeHttp()
+        http.json["https://api.anissia.net/anime/caption/animeNo/12"] = {
+            "data": [{"name": "Maker", "website": "https://blog.naver.com/maker/123"}]}
+        http.html["https://blog.naver.com/maker/123"] = (
+            '<meta property="og:title" content="[자막] 예시 작품 02화 자막">'
+            '<a href="https://download.blog.naver.com/02.srt" download="02.srt">2화</a>'
+            '<a href="https://download.blog.naver.com/03.srt" download="03.srt">3화</a>')
+
+        result = ReAnime(http).search_selected(Query("예시 작품", episode=2), Anime(12, "예시 작품"))
+
+        self.assertEqual([candidate.file_name for candidate in result.candidates], ["02.srt"])
+        self.assertEqual(result.candidates[0].confidence, "exact")
+
+    def test_registered_sequel_uses_family_tistory_search_and_card_title(self):
+        http = FakeHttp()
+        http.json["https://api.anissia.net/anime/caption/animeNo/12"] = {
+            "data": [{"name": "Maker", "website": "https://maker.tistory.com/123"}]}
+        http.html["https://maker.tistory.com/search/%EC%98%88%EC%8B%9C%20%EC%9E%91%ED%92%88%202%EA%B8%B0"] = "<html></html>"
+        http.html["https://maker.tistory.com/search/%EC%98%88%EC%8B%9C%20%EC%9E%91%ED%92%88"] = (
+            '<a href="/456" data-tiara-copy="예시 작품 2기 02화 자막">글 읽기</a>')
+        http.html["https://maker.tistory.com/456"] = (
+            '<meta property="og:title" content="예시 작품 2기 02화 자막">'
+            '<a href="https://blog.kakaocdn.net/file/02.srt">자막</a>')
+
+        result = ReAnime(http).search_selected(Query("예시 작품 2기", episode=2), Anime(12, "예시 작품 2기"))
+
+        self.assertEqual(len(result.candidates), 1)
+        self.assertEqual(result.candidates[0].source_url, "https://maker.tistory.com/456")
+        self.assertEqual(result.candidates[0].season, 2)
+
+    def test_tistory_clickable_search_cards_and_pagination_find_older_episode(self):
+        http = FakeHttp()
+        http.json["https://api.anissia.net/anime/caption/animeNo/12"] = {
+            "data": [{"name": "Maker", "website": "https://maker.tistory.com/entry/최근-글"}]}
+        search = "https://maker.tistory.com/search/%EC%98%88%EC%8B%9C"
+        http.html[search] = '<a href="/search/%EC%98%88%EC%8B%9C?page=2">다음</a>'
+        http.html[search + "?page=2"] = (
+            '<li class="flatbutton" onclick="window.open(\'/entry/one\',\'_self\')">'
+            '<span>2024.10.04 예시 1화 자막</span></li>')
+        http.html["https://maker.tistory.com/entry/one"] = (
+            '<meta property="og:title" content="예시 1화 자막">'
+            '<a href="https://blog.kakaocdn.net/file/01.srt">자막</a>')
+
+        result = ReAnime(http).search_selected(Query("예시", episode=1), Anime(12, "예시"))
+
+        self.assertEqual(len(result.candidates), 1)
+        self.assertEqual(result.candidates[0].source_url, "https://maker.tistory.com/entry/one")
+
+    def test_unreadable_google_page_is_an_error_not_a_confirmed_miss(self):
+        http = FakeHttp()
+        http.json["https://api.anissia.net/anime/list/0?q=%EC%98%88%EC%8B%9C"] = {
+            "data": {"content": []}}
+        http.json["https://api.anissia.net/anime/list/0"] = {
+            "data": {"content": [], "totalPages": 1}}
+        http.html["https://www.google.com/search?hl=ko&q=%EC%98%88%EC%8B%9C+1%ED%99%94+%EC%9E%90%EB%A7%89"] = "<html>unrecognized layout</html>"
+
+        result = ReAnime(http).search(Query("예시", episode=1))
+
+        self.assertEqual(result.status, "error")
+        self.assertTrue(any("Google" in warning for warning in result.warnings))
+
+    def test_optional_title_lookup_failure_does_not_call_open(self):
         http = FakeHttp()
         http.json["https://api.anissia.net/anime/list/0?q=Example"] = {"data": {"content": []}}
         http.json["https://api.anissia.net/anime/list/0"] = {"data": {"content": [], "totalPages": 1}}
-        http.html["https://www.google.com/search?hl=ko&q=Example+%EC%9E%90%EB%A7%89"] = "<html>No matches</html>"
+        http.html["https://www.google.com/search?hl=ko&q=Example+%EC%9E%90%EB%A7%89"] = "<html>did not match any documents</html>"
         open_source = Mock(search=Mock(return_value=SearchResult(status="empty")))
         result = SearchEngine(ReAnime(http), open_source).search(Query("Example"))
-        self.assertTrue(result.fallback_used)
-        open_source.search.assert_called_once()
+        self.assertEqual(result.status, "empty")
+        open_source.search.assert_not_called()
         self.assertTrue(any("AniList" in warning for warning in result.warnings))
 
-    def test_entire_google_fallback_search_and_download_work_without_edge(self):
+    def test_entire_google_fallback_search_and_download(self):
         http = FakeHttp()
         http.json["https://api.anissia.net/anime/list/0?q=Example"] = {"data": {"content": []}}
         http.json["https://api.anissia.net/anime/list/0"] = {"data": {"content": [], "totalPages": 1}}
@@ -280,41 +338,37 @@ class DownloadTests(unittest.TestCase):
         self.assertTrue(safe_name("CON").startswith("_"))
         self.assertEqual(safe_name("../evil?.srt"), "_evil_.srt")
 
+    def test_archive_does_not_use_unnumbered_file_when_other_episode_exists(self):
+        http = FakeHttp()
+        link = "https://blog.kakaocdn.net/download/all.zip"
+        original = zip_bytes({"subtitle.srt": "unknown", "03.srt": "third"})
+        http.binary[link] = Response(original, link, {})
+        with tempfile.TemporaryDirectory() as folder:
+            target, note = Downloader(Path(folder) / "subtitles", http).download(
+                Candidate("ReAnime/티스토리", "Example", "all.zip", "https://maker.tistory.com/123", link),
+                Query("Example", episode=2))
+            self.assertEqual(target.read_bytes(), original)
+            self.assertIn("원본 ZIP", note)
+
+    def test_download_rejects_file_for_another_episode(self):
+        http = FakeHttp()
+        link = "https://blog.kakaocdn.net/file/03.srt"
+        http.binary[link] = Response(b"1\n00:00:01,000 --> 00:00:02,000\nWrong", link, {})
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(SourceError, "화 정보"):
+                Downloader(Path(folder) / "subtitles", http).download(
+                    Candidate("ReAnime/티스토리", "Example", "03.srt", "https://maker.tistory.com/123", link),
+                    Query("Example", episode=2))
+
     def test_rejects_non_https_and_private_hosts(self):
         for url in ("http://example.com/01.srt", "https://127.0.0.1/x", "https://evil.com/x", "https://user:secret@blog.naver.com/x"):
             self.assertFalse(allowed_url(url))
 
-
-class BridgeTests(unittest.TestCase):
-    def test_local_edge_handoff_requires_token_and_extension_origin(self):
-        inbox = Queue()
-        bridge = BridgeServer("good-token", inbox, port=0)
-        bridge.start()
-        port = bridge.server.server_port
-        bridge.port = port
-        base = f"http://127.0.0.1:{port}"
-        try:
-            with self.assertRaises(Exception):
-                urlopen(Request(base + "/v1/status", headers={"Authorization": "Bearer wrong"}), timeout=2)
-            body = json.dumps({"title": "Example", "url": "https://example.org/anime"}).encode()
-            headers = {"Authorization": "Bearer good-token", "Content-Type": "application/json",
-                       "Origin": "chrome-extension://" + "a" * 32}
-            preflight = Request(base + "/v1/send", method="OPTIONS",
-                                headers={"Origin": headers["Origin"], "Access-Control-Request-Method": "POST",
-                                         "Access-Control-Request-Headers": "authorization,content-type"})
-            with urlopen(preflight, timeout=2) as response:
-                self.assertEqual(response.status, 204)
-                self.assertEqual(response.headers["Access-Control-Allow-Origin"], headers["Origin"])
-            with urlopen(Request(base + "/v1/send", data=body, headers=headers, method="POST"), timeout=2) as response:
-                self.assertEqual(response.status, 200)
-                self.assertEqual(response.headers["Access-Control-Allow-Origin"], headers["Origin"])
-            self.assertEqual(inbox.get_nowait()["title"], "Example")
-            headers["Origin"] = "https://malicious.example"
-            with self.assertRaises(Exception):
-                urlopen(Request(base + "/v1/send", data=body, headers=headers, method="POST"), timeout=2)
-            self.assertTrue(inbox.empty())
-        finally:
-            bridge.stop()
+    def test_korean_source_path_is_encoded_once_for_urllib(self):
+        self.assertEqual(_request_url("https://maker.tistory.com/entry/예시-1화"),
+                         "https://maker.tistory.com/entry/%EC%98%88%EC%8B%9C-1%ED%99%94")
+        self.assertEqual(_request_url("https://maker.tistory.com/entry/%EC%98%88%EC%8B%9C"),
+                         "https://maker.tistory.com/entry/%EC%98%88%EC%8B%9C")
 
 
 if __name__ == "__main__":
