@@ -16,7 +16,7 @@ import webbrowser
 from .bridge import BridgeServer, PORT
 from .downloader import Downloader
 from .engine import SearchEngine
-from .models import Query, SearchResult
+from .models import AnimeSearchResult, Query, SearchResult
 from .network import HttpClient
 from .providers.opensubtitles import OpenSubtitles
 from .providers.reanime import ReAnime
@@ -43,6 +43,7 @@ class App:
         self.engine = SearchEngine(self.reanime, self.open)
         self.downloader = Downloader(self.folder / "subtitles", self.http, self.open)
         self.results = SearchResult()
+        self.anime_results = AnimeSearchResult()
         self.current_query: Query | None = None
         self.busy = False
         self.generation = 0
@@ -50,7 +51,7 @@ class App:
         self.tab_inbox: Queue = Queue()
         self.bridge = None
         self.root.title("애니 자막 찾기 · ReAnime 우선")
-        self.root.geometry("1020x680")
+        self.root.geometry("1100x790")
         self._widgets()
         self._start_bridge()
         self.root.after(120, self._poll)
@@ -79,8 +80,10 @@ class App:
         top.columnconfigure(1, weight=1)
         actions = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         actions.pack(fill="x")
-        self.search_button = ttk.Button(actions, text="자막 검색 (ReAnime 우선)", command=self.search)
+        self.search_button = ttk.Button(actions, text="작품 찾기", command=self.search)
         self.search_button.pack(side="left", padx=(0, 6))
+        self.title_search_button = ttk.Button(actions, text="입력 제목으로 자막 검색", command=self.search_title)
+        self.title_search_button.pack(side="left", padx=6)
         self.open_button = ttk.Button(actions, text="OpenSubtitles에서도 검색", command=self.search_open)
         self.open_button.pack(side="left", padx=6)
         self.download_button = ttk.Button(actions, text="선택 자막 다운로드", command=self.download)
@@ -89,9 +92,32 @@ class App:
         self.cancel_button.pack(side="left", padx=6)
         ttk.Button(actions, text="저장 폴더", command=self.open_folder).pack(side="right", padx=6)
         ttk.Button(actions, text="OpenSubtitles API 키", command=self.configure_key).pack(side="right", padx=6)
-        self.status = tk.StringVar(value="작품명으로 직접 검색 가능 · 엣지 확장은 선택 사항")
+        self.status = tk.StringVar(value="키워드로 작품을 찾은 뒤 작품을 선택해 자막을 검색해 줘")
         ttk.Label(self.root, textvariable=self.status, padding=(12, 0, 12, 7)).pack(anchor="w")
 
+        anime_bar = ttk.Frame(self.root, padding=(12, 0, 12, 4))
+        anime_bar.pack(fill="x")
+        ttk.Label(anime_bar, text="검색된 작품").pack(side="left")
+        self.anime_search_button = ttk.Button(anime_bar, text="선택 작품 자막 검색", command=self.search_selected,
+                                              state="disabled")
+        self.anime_search_button.pack(side="left", padx=10)
+        anime_frame = ttk.Frame(self.root, padding=(12, 0, 12, 8))
+        anime_frame.pack(fill="x")
+        self.anime_tree = ttk.Treeview(anime_frame, columns=("subject", "original"), show="headings",
+                                       selectmode="browse", height=6)
+        self.anime_tree.heading("subject", text="작품명")
+        self.anime_tree.heading("original", text="원제")
+        self.anime_tree.column("subject", width=480)
+        self.anime_tree.column("original", width=480)
+        self.anime_tree.pack(side="left", fill="x", expand=True)
+        anime_scrollbar = ttk.Scrollbar(anime_frame, orient="vertical", command=self.anime_tree.yview)
+        anime_scrollbar.pack(side="right", fill="y")
+        self.anime_tree.configure(yscrollcommand=anime_scrollbar.set)
+        self.anime_tree.bind("<<TreeviewSelect>>", self._select_anime)
+        self.anime_tree.bind("<Double-1>", lambda _: self.search_selected())
+        self.anime_tree.bind("<Return>", lambda _: self.search_selected())
+
+        ttk.Label(self.root, text="자막 후보", padding=(12, 0, 12, 0)).pack(anchor="w")
         columns = ("source", "title", "episode", "lang", "file", "match")
         frame = ttk.Frame(self.root, padding=(12, 0, 12, 5))
         frame.pack(fill="both", expand=True)
@@ -156,6 +182,8 @@ class App:
         generation = self.generation
         self.status.set(message)
         self.search_button.configure(state="disabled")
+        self.title_search_button.configure(state="disabled")
+        self.anime_search_button.configure(state="disabled")
         self.open_button.configure(state="disabled")
         self.download_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
@@ -172,8 +200,37 @@ class App:
         query = self._query()
         if not query:
             return
+        if query.language != "ko":
+            self.current_query = query
+            self._run("OpenSubtitles 검색 중…", lambda: ("search", self.engine.search(query)))
+            return
+        self._run("애니시아 작품 검색 중…", lambda: ("anime", self.reanime.discover(query.title)))
+
+    def search_title(self):
+        if self.busy:
+            return
+        query = self._query()
+        if not query:
+            return
         self.current_query = query
         self._run("애니시아와 자막 제작자 글 검색 중…", lambda: ("search", self.engine.search(query)))
+
+    def search_selected(self):
+        if self.busy:
+            return
+        selected = self.anime_tree.selection()
+        if not selected:
+            return
+        anime = next((a for a in self.anime_results.anime if str(a.anime_no) == selected[0]), None)
+        if anime is None:
+            return
+        query = self._query()
+        if query is None:
+            return
+        query = Query(anime.subject, query.language, query.season, query.episode)
+        self.title.set(anime.subject)
+        self.current_query = query
+        self._run(f"{anime.subject} 자막 검색 중…", lambda: ("search", self.engine.search_selected(query, anime)))
 
     def search_open(self):
         if self.busy:
@@ -214,6 +271,8 @@ class App:
         self.generation += 1
         self.busy = False
         self.search_button.configure(state="normal")
+        self.title_search_button.configure(state="normal")
+        self.anime_search_button.configure(state="normal" if self.anime_tree.selection() else "disabled")
         self.open_button.configure(state="normal")
         self.download_button.configure(state="normal")
         self.cancel_button.configure(state="disabled")
@@ -221,10 +280,21 @@ class App:
 
     def _populate(self):
         self.tree.delete(*self.tree.get_children())
+        self.details.set("자막 후보를 선택하면 원문 주소를 볼 수 있음")
         for index, candidate in enumerate(self.results.candidates):
             target = f"S{candidate.season or '?'}E{candidate.episode or '?'}"
             self.tree.insert("", "end", iid=str(index), values=(candidate.provider, candidate.title, target,
                                                                  candidate.language, candidate.file_name, candidate.confidence))
+
+    def _populate_anime(self):
+        self.anime_tree.delete(*self.anime_tree.get_children())
+        for anime in self.anime_results.anime:
+            self.anime_tree.insert("", "end", iid=str(anime.anime_no),
+                                   values=(anime.subject, anime.original_subject))
+        self.anime_search_button.configure(state="disabled")
+
+    def _select_anime(self, _event=None):
+        self.anime_search_button.configure(state="normal" if self.anime_tree.selection() and not self.busy else "disabled")
 
     def _select(self, _event=None):
         selected = self.tree.selection()
@@ -240,6 +310,8 @@ class App:
                     continue
                 self.busy = False
                 self.search_button.configure(state="normal")
+                self.title_search_button.configure(state="normal")
+                self.anime_search_button.configure(state="normal" if self.anime_tree.selection() else "disabled")
                 self.open_button.configure(state="normal")
                 self.download_button.configure(state="normal")
                 self.cancel_button.configure(state="disabled")
@@ -250,6 +322,15 @@ class App:
                 if operation == "download":
                     path, note = outcome
                     self.status.set("저장됨: " + str(path) + (" · " + note if note else ""))
+                elif operation == "anime":
+                    self.anime_results = outcome
+                    self._populate_anime()
+                    self.results = SearchResult()
+                    self.current_query = None
+                    self._populate()
+                    warning = " · " + outcome.warnings[0] if outcome.warnings else ""
+                    self.status.set(f"작품 {len(outcome.anime)}개 · 작품을 선택해 자막 검색{warning}" if outcome.anime else
+                                    f"검색된 작품 없음 · 정확한 제목이면 입력 제목으로 자막 검색{warning}")
                 else:
                     self.results = outcome
                     self._populate()

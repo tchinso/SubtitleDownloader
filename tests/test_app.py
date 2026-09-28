@@ -11,7 +11,7 @@ from io import BytesIO
 from subfinder.bridge import BridgeServer
 from subfinder.downloader import Downloader, safe_name
 from subfinder.engine import SearchEngine
-from subfinder.models import Candidate, Query, SearchResult
+from subfinder.models import Anime, Candidate, Query, SearchResult
 from subfinder.network import Response, SourceError, allowed_url
 from subfinder.providers.opensubtitles import OpenSubtitles
 from subfinder.providers.reanime import ReAnime
@@ -66,6 +66,18 @@ class FlowTests(unittest.TestCase):
         self.assertTrue(result.fallback_used)
         second.search.assert_called_once()
 
+    def test_selected_anime_empty_search_falls_back_with_selected_title(self):
+        anime = Anime(12, "외톨이의 이세계 공략")
+        first = Mock(search_selected=Mock(return_value=SearchResult(status="empty")))
+        second = Mock(search=Mock(return_value=SearchResult(status="empty")))
+        query = Query(anime.subject, episode=1)
+
+        result = SearchEngine(first, second).search_selected(query, anime)
+
+        first.search_selected.assert_called_once_with(query, anime)
+        second.search.assert_called_once_with(query)
+        self.assertTrue(result.fallback_used)
+
     def test_error_is_not_misreported_as_absent_and_manual_search_works(self):
         first = Mock(search=Mock(return_value=SearchResult(status="error", warnings=["HTTP 403"])))
         second = Mock(search=Mock(return_value=SearchResult(status="empty")))
@@ -86,6 +98,64 @@ class FlowTests(unittest.TestCase):
 
 
 class SourceTests(unittest.TestCase):
+    def test_keyword_discovery_accepts_zero_pages_for_no_matches(self):
+        http = FakeHttp()
+        http.json["https://api.anissia.net/anime/list/0?q=missing"] = {
+            "code": "ok", "data": {"totalPages": 0, "content": []}}
+
+        result = ReAnime(http).discover("missing")
+
+        self.assertEqual(result.status, "empty")
+        self.assertEqual(result.anime, [])
+        self.assertEqual(result.warnings, [])
+
+    def test_keyword_discovery_reads_all_anissia_pages_without_exact_title_filter(self):
+        http = FakeHttp()
+        base = "https://api.anissia.net/anime/list/"
+        query = "?q=%EC%9D%B4%EC%84%B8%EA%B3%84"
+        http.json[base + "0" + query] = {"code": "ok", "data": {"totalPages": 3, "content": [
+            {"animeNo": 1, "subject": "외톨이의 이세계 공략", "originalSubject": ""},
+            {"animeNo": 2, "subject": "관계없는 작품", "originalSubject": "이세계의 여행"}]}}
+        http.json[base + "1" + query] = {"code": "ok", "data": {"totalPages": 3, "content": [
+            {"animeNo": 1, "subject": "외톨이의 이세계 공략"},
+            {"animeNo": 3, "subject": "이세계 유유자적 농가"}]}}
+        http.json[base + "2" + query] = {"code": "ok", "data": {"totalPages": 3, "content": [
+            {"animeNo": 4, "subject": "이세계 콰르텟"},
+            {"animeNo": 5, "subject": "다른 세계"}]}}
+
+        result = ReAnime(http).discover("이세계")
+
+        self.assertEqual(result.status, "found")
+        self.assertEqual([anime.anime_no for anime in result.anime], [1, 2, 3, 4])
+        self.assertEqual(result.anime[0].subject, "외톨이의 이세계 공략")
+        self.assertEqual([url for kind, url, _ in http.calls if kind == "json"],
+                         [base + str(page) + query for page in range(3)])
+
+    def test_keyword_discovery_keeps_partial_results_and_reports_page_failure(self):
+        http = FakeHttp()
+        http.json["https://api.anissia.net/anime/list/0?q=%EC%9D%B4%EC%84%B8%EA%B3%84"] = {
+            "data": {"totalPages": 2, "content": [{"animeNo": 12, "subject": "이세계 공략"}]}}
+
+        result = ReAnime(http).discover("이세계")
+
+        self.assertEqual(result.status, "found")
+        self.assertEqual(result.anime, [Anime(12, "이세계 공략")])
+        self.assertTrue(any("2페이지" in warning for warning in result.warnings))
+
+    def test_selected_anime_uses_its_id_and_title_without_reidentification(self):
+        http = FakeHttp()
+        captions = "https://api.anissia.net/anime/caption/animeNo/12"
+        http.json[captions] = {"data": [{"name": "Maker", "website": "https://blog.naver.com/maker/123"}]}
+        http.html["https://blog.naver.com/maker/123"] = (
+            '<meta property="og:title" content="외톨이의 이세계 공략 01화 자막">'
+            '<a href="https://download.blog.naver.com/open/01.srt" download="01.srt">file</a>')
+
+        result = ReAnime(http).search_selected(Query("이세계", episode=1), Anime(12, "외톨이의 이세계 공략"))
+
+        self.assertEqual(result.status, "found")
+        self.assertEqual(result.candidates[0].title, "외톨이의 이세계 공략 01화 자막")
+        self.assertEqual([url for kind, url, _ in http.calls if kind == "json"], [captions])
+
     def test_optional_title_lookup_failure_does_not_block_open_fallback(self):
         http = FakeHttp()
         http.json["https://api.anissia.net/anime/list/0?q=Example"] = {"data": {"content": []}}

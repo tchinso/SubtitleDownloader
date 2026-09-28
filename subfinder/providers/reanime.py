@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit
 from ..htmlparse import Document
 from ..matching import (FORMATS, ARCHIVES, drive_id, episode_of, file_name_from_url,
                         matching_post, normal, season_of, suitable_file)
-from ..models import Candidate, Query, SearchResult
+from ..models import Anime, AnimeSearchResult, Candidate, Query, SearchResult
 from ..network import HttpClient, SourceError, allowed_url
 
 
@@ -46,6 +46,53 @@ class ReAnime:
     def __init__(self, http: HttpClient | None = None):
         self.http = http or HttpClient()
         self._catalog: list[dict] | None = None
+
+    def discover(self, keyword: str) -> AnimeSearchResult:
+        """Browse Anissia titles by keyword before searching a selected title's subtitles."""
+        term = keyword.strip()
+        wanted = normal(term)
+        if not wanted:
+            return AnimeSearchResult(status="error", warnings=["검색어를 입력해 줘"])
+
+        anime: dict[int, Anime] = {}
+        warnings: list[str] = []
+        page = 0
+        page_count = 1
+        while page < page_count:
+            url = f"https://api.anissia.net/anime/list/{page}?{urlencode({'q': term})}"
+            try:
+                response = self.http.get_json(url)
+                if response.get("code", "ok") != "ok":
+                    raise SourceError("애니시아 작품 검색 응답 오류")
+                data = response.get("data") or {}
+                content = data.get("content")
+                pages = data.get("totalPages", 1)
+                if (not isinstance(content, list) or not isinstance(pages, int)
+                        or pages < 0 or (pages == 0 and (page != 0 or content))):
+                    raise SourceError("애니시아 작품 검색 응답 형식 오류")
+                if page == 0:
+                    page_count = min(pages, 200)
+                    if pages > 200:
+                        warnings.append("애니시아 검색 결과는 처음 200페이지만 확인했어")
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    anime_no = item.get("animeNo")
+                    subject = item.get("subject")
+                    original = item.get("originalSubject") or ""
+                    if (not isinstance(anime_no, int) or anime_no <= 0
+                            or not isinstance(subject, str) or not subject.strip()
+                            or not isinstance(original, str)):
+                        continue
+                    if wanted not in normal(subject) and wanted not in normal(original):
+                        continue
+                    anime.setdefault(anime_no, Anime(anime_no, subject, original))
+            except (SourceError, AttributeError, TypeError, ValueError) as exc:
+                warnings.append(f"애니시아 작품 검색 {page + 1}페이지: {exc}")
+                break
+            page += 1
+        return AnimeSearchResult(list(anime.values()), warnings,
+                                 "found" if anime else "error" if warnings else "empty")
 
     def names(self, query: Query, warnings: list[str]) -> list[str]:
         result = [query.title.strip()]
@@ -422,8 +469,22 @@ class ReAnime:
         if not query.title.strip():
             return SearchResult(status="error", warnings=["작품명을 입력해 줘"])
         names = self.names(query, alias_warnings)
-        found: list[Candidate] = []
         works = self._anime(names, query.season, warnings)
+        return self._search_works(query, works, names, alias_warnings, warnings)
+
+    def search_selected(self, query: Query, anime: Anime) -> SearchResult:
+        """Search subtitles for an explicitly selected Anissia work."""
+        if anime.anime_no <= 0 or not anime.subject.strip():
+            return SearchResult(status="error", warnings=["선택한 작품 정보가 올바르지 않아"])
+        selected = Query(anime.subject, query.language, query.season, query.episode, query.slug)
+        names = list(dict.fromkeys(name for name in (anime.subject, anime.original_subject) if name))
+        work = {"animeNo": anime.anime_no, "subject": anime.subject,
+                "originalSubject": anime.original_subject}
+        return self._search_works(selected, [work], names, [], [])
+
+    def _search_works(self, query: Query, works: list[dict], names: list[str],
+                      alias_warnings: list[str], warnings: list[str]) -> SearchResult:
+        found: list[Candidate] = []
         for work in works:
             ident = work["animeNo"]
             subject = work.get("subject", query.title)

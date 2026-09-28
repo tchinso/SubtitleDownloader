@@ -10,6 +10,20 @@ class Query:
     slug: str = ""
 
 
+@dataclass(frozen=True)
+class Anime:
+    anime_no: int
+    subject: str
+    original_subject: str = ""
+
+
+@dataclass
+class AnimeSearchResult:
+    anime: list[Anime] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    status: str = "empty"  # found, empty, error
+
+
 @dataclass
 class Candidate:
     provider: str

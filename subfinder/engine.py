@@ -1,4 +1,4 @@
-from .models import Query, SearchResult
+from .models import Anime, Query, SearchResult
 from .providers.reanime import ReAnime
 from .providers.opensubtitles import OpenSubtitles
 
@@ -14,7 +14,15 @@ class SearchEngine:
             result = self.open_subtitles.search(query)
             result.fallback_used = True
             return result
-        first = self.reanime.search(query)
+        return self._with_fallback(query, self.reanime.search(query))
+
+    def search_selected(self, query: Query, anime: Anime) -> SearchResult:
+        """Search the chosen Anissia work without guessing its identity again."""
+        if query.language != "ko":
+            return self.search(query)
+        return self._with_fallback(query, self.reanime.search_selected(query, anime))
+
+    def _with_fallback(self, query: Query, first: SearchResult) -> SearchResult:
         if first.candidates or first.status == "error":
             return first
         second = self.open_subtitles.search(query)
