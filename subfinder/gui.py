@@ -12,7 +12,7 @@ import webbrowser
 
 from .downloader import Downloader
 from .engine import SearchEngine
-from .models import AnimeSearchResult, Query, SearchResult
+from .models import AnimeSearchResult, CreatorBlog, Query, SearchResult
 from .network import HttpClient
 from .providers.opensubtitles import OpenSubtitles
 from .providers.reanime import ReAnime
@@ -105,6 +105,9 @@ class App:
         self.anime_search_button = ttk.Button(anime_bar, text="선택 작품 자막 검색", command=self.search_selected,
                                               state="disabled")
         self.anime_search_button.pack(side="left", padx=10)
+        self.creator_blog_button = ttk.Button(anime_bar, text="선택 작품 원본 블로그 열기",
+                                              command=self.open_creator_blog, state="disabled")
+        self.creator_blog_button.pack(side="left")
         anime_frame = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         anime_frame.pack(fill="x")
         self.anime_tree = ttk.Treeview(anime_frame, columns=("subject", "original"), show="headings",
@@ -121,7 +124,7 @@ class App:
         self.anime_tree.bind("<Double-1>", lambda _: self.search_selected())
         self.anime_tree.bind("<Return>", lambda _: self.search_selected())
 
-        ttk.Label(self.root, text="자막 후보", padding=(12, 0, 12, 0)).pack(anchor="w")
+        ttk.Label(self.root, text="자막 후보 (더블클릭 또는 우클릭으로 다운로드)", padding=(12, 0, 12, 0)).pack(anchor="w")
         columns = ("source", "title", "episode", "lang", "file", "match")
         frame = ttk.Frame(self.root, padding=(12, 0, 12, 5))
         frame.pack(fill="both", expand=True)
@@ -135,6 +138,12 @@ class App:
         scrollbar.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.bind("<<TreeviewSelect>>", self._select)
+        self.tree.bind("<Double-1>", self._download_on_double_click)
+        self.tree.bind("<Return>", lambda _: self.download())
+        self.tree.bind("<Button-3>", self._candidate_context_menu)
+        self.candidate_menu = tk.Menu(self.root, tearoff=False)
+        self.candidate_menu.add_command(label="자막 다운로드", command=self.download)
+        self.candidate_menu.add_command(label="원문 열기", command=self.open_source)
         self.details = tk.StringVar(value="자막 후보를 선택하면 원문 주소를 볼 수 있음")
         ttk.Label(self.root, textvariable=self.details, wraplength=970, padding=(12, 4, 12, 8)).pack(anchor="w")
         link = ttk.Frame(self.root, padding=(12, 0, 12, 8))
@@ -169,7 +178,7 @@ class App:
             self.status.set("ReAnime 출처는 한국어 중심임. 다른 언어는 API 키를 등록하고 OpenSubtitles에서 검색해 줘")
         return Query(title=title, language=language, season=fields[0], episode=fields[1])
 
-    def _run(self, message: str, task):
+    def _run(self, message: str, task, error_title: str = ""):
         if self.busy:
             return
         self.google_help.pack_forget()
@@ -180,6 +189,7 @@ class App:
         self.search_button.configure(state="disabled")
         self.title_search_button.configure(state="disabled")
         self.anime_search_button.configure(state="disabled")
+        self.creator_blog_button.configure(state="disabled")
         self.open_button.configure(state="disabled")
         self.bigfile_button.configure(state="disabled")
         self.download_button.configure(state="disabled")
@@ -188,7 +198,7 @@ class App:
             try:
                 self.events.put((generation, "done", task()))
             except Exception as exc:
-                self.events.put((generation, "error", str(exc)))
+                self.events.put((generation, "error", (error_title, str(exc))))
         threading.Thread(target=worker, daemon=True).start()
 
     def search(self):
@@ -229,6 +239,60 @@ class App:
         self.current_query = query
         self._run(f"{anime.subject} 자막 검색 중…", lambda: ("search", self.engine.search_selected(query, anime)))
 
+    def open_creator_blog(self):
+        if self.busy:
+            return
+        selected = self.anime_tree.selection()
+        anime = next((item for item in self.anime_results.anime
+                      if selected and str(item.anime_no) == selected[0]), None)
+        if anime is None:
+            messagebox.showinfo("원본 블로그", "먼저 애니시아 작품을 선택해 줘")
+            return
+        self._run(f"{anime.subject} 제작자 블로그 확인 중…",
+                  lambda: ("blogs", self.reanime.creator_blogs(anime)))
+
+    def _show_creator_blogs(self, blogs: list[CreatorBlog]):
+        if not blogs:
+            self.status.set("선택한 작품의 애니시아 제작자 목록에 열 수 있는 블로그 주소가 없어")
+            return
+        if len(blogs) == 1:
+            webbrowser.open(blogs[0].url)
+            self.status.set(f"{blogs[0].creator} 블로그를 브라우저에서 열었어")
+            return
+        popup = tk.Toplevel(self.root)
+        popup.title("원본 블로그 선택")
+        popup.transient(self.root)
+        popup.geometry("660x280")
+        content = ttk.Frame(popup, padding=12)
+        content.pack(fill="both", expand=True)
+        ttk.Label(content, text="열 원본 블로그를 선택해 줘").pack(anchor="w", pady=(0, 8))
+        tree = ttk.Treeview(content, columns=("creator", "url"), show="headings", selectmode="browse")
+        tree.heading("creator", text="제작자")
+        tree.heading("url", text="블로그 주소")
+        tree.column("creator", width=130, stretch=False)
+        tree.column("url", width=480)
+        tree.pack(fill="both", expand=True)
+        for index, blog in enumerate(blogs):
+            tree.insert("", "end", iid=str(index), values=(blog.creator, blog.url))
+        tree.selection_set("0")
+
+        def open_selected(_event=None):
+            selected = tree.selection()
+            if selected:
+                blog = blogs[int(selected[0])]
+                webbrowser.open(blog.url)
+                self.status.set(f"{blog.creator} 블로그를 브라우저에서 열었어")
+                popup.destroy()
+
+        tree.bind("<Double-1>", open_selected)
+        tree.bind("<Return>", open_selected)
+        buttons = ttk.Frame(content)
+        buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(buttons, text="브라우저에서 열기", command=open_selected).pack(side="left")
+        ttk.Button(buttons, text="닫기", command=popup.destroy).pack(side="right")
+        popup.grab_set()
+        popup.focus_set()
+
     def search_open(self):
         if self.busy:
             return
@@ -267,11 +331,12 @@ class App:
     def download(self):
         if self.busy:
             return
-        if not self.current_query:
-            return
         selected = self.tree.selection()
         if not selected:
             messagebox.showinfo("자막 후보", "먼저 자막 파일을 선택해 줘")
+            return
+        if not self.current_query:
+            messagebox.showerror("다운로드 실패", "검색 조건을 확인할 수 없습니다. 자막을 다시 검색해 주세요.")
             return
         candidate = self.results.candidates[int(selected[0])]
         if candidate.provider == "Bigfile" and not candidate.download_url:
@@ -279,7 +344,30 @@ class App:
             self.status.set("Bigfile 사이트에서 '애니'를 선택하고 영문 제목으로 다시 검색한 뒤 로그인하여 다운로드해 줘")
             return
         query = self.current_query
-        self._run("선택한 자막 다운로드 중…", lambda: ("download", self.downloader.download(candidate, query)))
+        self._run("선택한 자막 다운로드 중…", lambda: ("download", self.downloader.download(candidate, query)),
+                  error_title="다운로드 실패")
+
+    def _download_on_double_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if row:
+            self.tree.selection_set(row)
+            self.tree.focus(row)
+            self.download()
+
+    def _candidate_context_menu(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        self.tree.selection_set(row)
+        self.tree.focus(row)
+        self._select()
+        candidate = self.results.candidates[int(row)]
+        label = "Bigfile에서 다운로드" if candidate.provider == "Bigfile" and not candidate.download_url else "자막 다운로드"
+        self.candidate_menu.entryconfigure(0, label=label)
+        try:
+            self.candidate_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.candidate_menu.grab_release()
 
     def open_source(self):
         selected = self.tree.selection()
@@ -298,6 +386,7 @@ class App:
         self.search_button.configure(state="normal")
         self.title_search_button.configure(state="normal")
         self.anime_search_button.configure(state="normal" if self.anime_tree.selection() else "disabled")
+        self.creator_blog_button.configure(state="normal" if self.anime_tree.selection() else "disabled")
         self.open_button.configure(state="normal")
         self.bigfile_button.configure(state="normal")
         self.download_button.configure(state="normal")
@@ -318,9 +407,11 @@ class App:
             self.anime_tree.insert("", "end", iid=str(anime.anime_no),
                                    values=(anime.subject, anime.original_subject))
         self.anime_search_button.configure(state="disabled")
+        self.creator_blog_button.configure(state="disabled")
 
     def _select_anime(self, _event=None):
         self.anime_search_button.configure(state="normal" if self.anime_tree.selection() and not self.busy else "disabled")
+        self.creator_blog_button.configure(state="normal" if self.anime_tree.selection() and not self.busy else "disabled")
 
     def _select(self, _event=None):
         selected = self.tree.selection()
@@ -338,18 +429,23 @@ class App:
                 self.search_button.configure(state="normal")
                 self.title_search_button.configure(state="normal")
                 self.anime_search_button.configure(state="normal" if self.anime_tree.selection() else "disabled")
+                self.creator_blog_button.configure(state="normal" if self.anime_tree.selection() else "disabled")
                 self.open_button.configure(state="normal")
                 self.bigfile_button.configure(state="normal")
                 self.download_button.configure(state="normal")
                 self.cancel_button.configure(state="disabled")
                 if kind == "error":
                     self.google_help.pack_forget()
-                    self.status.set("작업 실패: " + value)
+                    title, description = value if isinstance(value, tuple) else ("", value)
+                    self.status.set("작업 실패: " + description)
+                    if title:
+                        messagebox.showerror(title, description + "\n\n원문을 확인하려면 '선택 원문 열기'를 눌러 주세요.")
                     continue
                 operation, outcome = value
                 if operation == "download":
                     path, note = outcome
                     self.status.set("저장됨: " + str(path) + (" · " + note if note else ""))
+                    messagebox.showinfo("다운로드 완료", str(path) + ("\n\n" + note if note else ""))
                 elif operation == "anime":
                     self.google_help.pack_forget()
                     self.anime_results = outcome
@@ -360,6 +456,8 @@ class App:
                     warning = " · " + outcome.warnings[0] if outcome.warnings else ""
                     self.status.set(f"작품 {len(outcome.anime)}개 · 작품을 선택해 자막 검색{warning}" if outcome.anime else
                                     f"검색된 작품 없음 · 정확한 제목이면 입력 제목으로 자막 검색{warning}")
+                elif operation == "blogs":
+                    self._show_creator_blogs(outcome)
                 else:
                     self.results = outcome
                     self._populate()

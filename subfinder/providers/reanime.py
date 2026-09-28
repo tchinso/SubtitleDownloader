@@ -6,6 +6,7 @@ files, reuse the ReAnime extension, or execute scripts from source pages.
 
 import json
 import re
+import unicodedata
 from dataclasses import replace
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit
 
@@ -13,12 +14,37 @@ from ..htmlparse import Document
 from ..matching import (drive_id, episode_of, episode_range, file_name_from_url,
                         is_special, matching_post, matching_public_title, normal, season_of, suitable_file,
                         title_queries, without_mixed_specials)
-from ..models import Anime, AnimeSearchResult, Candidate, Query, SearchResult
+from ..models import Anime, AnimeSearchResult, Candidate, CreatorBlog, Query, SearchResult
 from ..network import HttpClient, SourceError, allowed_url
 
 
 def _host(url: str) -> str:
     return (urlsplit(url).hostname or "").lower()
+
+
+def _creator_blog_url(website: str) -> str | None:
+    """Turn an Anissia caption post URL into its creator's blog home page."""
+    if not isinstance(website, str):
+        return None
+    try:
+        parsed = urlsplit(website.strip())
+        if (parsed.scheme not in ("http", "https") or parsed.username or parsed.password
+                or parsed.port not in (None, 80, 443)):
+            return None
+        host = (parsed.hostname or "").lower()
+        if host in ("blog.naver.com", "m.blog.naver.com"):
+            params = parse_qs(parsed.query)
+            parts = parsed.path.strip("/").split("/")
+            blog_id = params.get("blogId", [parts[0] if parts else ""])[0]
+            if re.fullmatch(r"[\w-]+", blog_id) and blog_id not in ("PostView.naver", "PostSearchList.naver"):
+                return f"https://blog.naver.com/{blog_id}"
+        elif host.endswith((".blogspot.com", ".tistory.com")):
+            homepage = f"https://{host}"
+            if allowed_url(homepage):
+                return homepage + "/"
+    except ValueError:
+        return None
+    return None
 
 
 def _naver_url(url: str) -> str | None:
@@ -53,10 +79,46 @@ def _post_confidence(title: str, aliases: list[str], query: Query) -> str:
                                                query.episode) != "none" else "none")
 
 
+def _family_title(title: str) -> str:
+    """Remove a confirmed season suffix for searching the same creator's older posts."""
+    value = unicodedata.normalize("NFKC", title)
+    value = re.sub(
+        r"(?:season|시즌)\s*\d{1,2}(?:\s*(?:기|期))?"
+        r"|(?:[제第]\s*)?\d{1,2}\s*(?:기|期)"
+        r"|\b\d{1,2}(?:st|nd|rd|th)\s+season\b",
+        " ", value, flags=re.I)
+    value = re.sub(
+        r"(?:\s+|(?<=[가-힣ぁ-んァ-ヶ一-龯]))(?:VIII|VII|III|VI|IV|IX|II|V|X)"
+        r"(?=\s*(?:$|[:~～〜]|[-–—]\s|Part\b|Cour\b))",
+        " ", value)
+    value = re.sub(r"\s+\d{1,2}(?:st|nd|rd|th)\s*$|\s+[2-9]\s*$", " ", value, flags=re.I)
+    return re.sub(r"\s+", " ", value).strip()
+
+
 class ReAnime:
     def __init__(self, http: HttpClient | None = None):
         self.http = http or HttpClient()
         self._catalog: list[dict] | None = None
+
+    def creator_blogs(self, anime: Anime) -> list[CreatorBlog]:
+        """List creator blog home pages from the selected Anissia work's captions."""
+        if anime.anime_no <= 0:
+            raise SourceError("선택한 작품 정보가 올바르지 않아")
+        response = self.http.get_json(f"https://api.anissia.net/anime/caption/animeNo/{anime.anime_no}")
+        if response.get("code", "ok") != "ok" or not isinstance(response.get("data"), list):
+            raise SourceError("애니시아 제작자 목록 응답 오류")
+        blogs: list[CreatorBlog] = []
+        seen: set[str] = set()
+        for creator in response["data"]:
+            if not isinstance(creator, dict):
+                continue
+            url = _creator_blog_url(creator.get("website", ""))
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            name = creator.get("name", "")
+            blogs.append(CreatorBlog(name.strip() if isinstance(name, str) and name.strip() else "제작자", url))
+        return blogs
 
     def discover(self, keyword: str) -> AnimeSearchResult:
         """Browse Anissia titles by keyword before searching a selected title's subtitles."""
@@ -254,9 +316,10 @@ class ReAnime:
             result = self._candidates_from_naver_post(canonical, aliases, query, creator)
         except SourceError:
             result = []  # A deleted latest post need not hide the creator's other posts.
-        if result:
+        if result and query.episode is not None:
             return result
         blog_id = urlsplit(canonical).path.strip("/").split("/")[0]
+        seen_posts = {canonical} if result else set()
         for alias in (search_terms or aliases)[:6]:
             base = "https://blog.naver.com/PostSearchList.naver?" + urlencode({"blogId": blog_id, "SearchText": alias})
             queue = [base]
@@ -279,10 +342,15 @@ class ReAnime:
                         if params.get("blogId") == [blog_id] and params.get("SearchText") == [alias] and (params.get("page") or params.get("currentPage")):
                             queue.append(target)
                 for post in list(dict.fromkeys(posts))[:6]:
+                    if post in seen_posts:
+                        continue
+                    seen_posts.add(post)
                     result.extend(self._candidates_from_naver_post(post, aliases, query, creator))
-                if result:
+                if result and query.episode is not None:
                     return result
-        return result
+                if len(seen_posts) >= 100:
+                    return list({candidate.key: candidate for candidate in result}.values())
+        return list({candidate.key: candidate for candidate in result}.values())
 
     def _tistory_post(self, url: str, aliases: list[str], query: Query, creator: str):
         html = self.http.get_text(url)
@@ -306,21 +374,24 @@ class ReAnime:
         return result
 
     def _tistory(self, source: str, aliases: list[str], query: Query, creator: str,
-                 search_terms: list[str] | None = None):
+                  search_terms: list[str] | None = None):
         parsed = urlsplit(source)
         origin = f"https://{parsed.hostname}"
+        result = []
+        seen_posts = set()
         if re.fullmatch(r"/(?:\d+|entry/[^/]+)/?", parsed.path):
             try:
-                result = self._tistory_post(source, aliases, query, creator)
+                result.extend(self._tistory_post(source, aliases, query, creator))
             except SourceError:
-                result = []
-            if result:
+                pass
+            if result and query.episode is not None:
                 return result
+            if result:
+                seen_posts.add(source)
         for alias in (search_terms or aliases)[:6]:
             base = f"{origin}/search/{quote(alias, safe='')}"
             queue = [base]
             visited = set()
-            result = []
             while queue and len(visited) < 5:
                 url = queue.pop(0)
                 if url in visited:
@@ -342,10 +413,54 @@ class ReAnime:
                     if path == urlsplit(base).path and parse_qs(urlsplit(target).query).get("page") and len(queue) < 4:
                         queue.append(target)
                 for post in list(dict.fromkeys(posts))[:6]:
+                    if post in seen_posts:
+                        continue
+                    seen_posts.add(post)
                     result.extend(self._tistory_post(post, aliases, query, creator))
-                if result:
+                if result and query.episode is not None:
                     return result
-        return []
+                if len(seen_posts) >= 100:
+                    return list({candidate.key: candidate for candidate in result}.values())
+        return list({candidate.key: candidate for candidate in result}.values())
+
+    def _tistory_offset_candidates(self, source: str, subject: str, query: Query,
+                                   creator: dict) -> list[Candidate]:
+        """Offer a season-to-cumulative episode mapping only when the latest post proves it."""
+        season = season_of(subject)
+        if (query.episode is None or season is None or season <= 1
+                or query.season not in (None, season)):
+            return []
+        try:
+            registered_latest = int(creator.get("episode", 0))
+        except (TypeError, ValueError):
+            return []
+        source = self._https_source(source)
+        family = _family_title(subject)
+        if (not allowed_url(source) or not 0 < query.episode <= registered_latest <= 999 or not family
+                or normal(family) == normal(subject)
+                or not re.fullmatch(r"/(?:\d+|entry/[^/]+)/?", urlsplit(source).path)):
+            return []
+        article = Document(self.http.get_text(source))
+        latest_title = article.meta.get("og:title") or article.title
+        latest_source_episode = episode_of(latest_title)
+        if (latest_source_episode is None
+                or matching_post(latest_title, [family], None, latest_source_episode) != "exact"):
+            return []
+        offset = latest_source_episode - registered_latest
+        source_episode = query.episode + offset
+        if offset <= 0 or source_episode <= 0 or source_episode > 999:
+            return []
+        alternate = self._tistory(source, [family],
+                                   Query(family, query.language, None, source_episode, query.slug),
+                                   creator.get("name", ""), [family])
+        note = (f"시즌 {season} {query.episode}화 / 원문 통산 {source_episode}화 후보. "
+                "애니시아 최신 화와 원문 번호 차이로 찾았습니다. 시즌을 확인해 주세요.")
+        return [replace(candidate, title=f"{candidate.title} · 시즌 {query.episode}화 / 통산 {source_episode}화",
+                        season=season, episode=query.episode, source_episode=source_episode,
+                        confidence="review", require_episode=True, note=note)
+                for candidate in alternate
+                if (candidate.episode == source_episode
+                    and matching_post(candidate.page_title, [family], None, source_episode) == "exact")]
 
     def _blogger_content(self, content: str, title: str, source: str, aliases: list[str], query: Query, creator: str):
         confidence = _post_confidence(title, aliases, query)
@@ -608,8 +723,7 @@ class ReAnime:
                                  query.episode, query.slug)
             search_terms = title_queries(subject, aliases)
             if (source_query.season or 1) > 1:
-                family = re.sub(r"(?:season|시즌)\s*\d+\s*(?:기|期)?|제?\s*\d+\s*(?:기|期)",
-                                "", subject, flags=re.I).strip()
+                family = _family_title(subject)
                 if family and normal(family) != normal(subject):
                     search_terms.append(family)
             try:
@@ -628,10 +742,18 @@ class ReAnime:
                     warnings.append(f"{creator.get('name', '제작자')}: 원문 주소 없음")
                     continue
                 try:
-                    found.extend(self._read_source(source, aliases, source_query,
-                                                   creator.get("name", ""), search_terms))
+                    source_candidates = self._read_source(source, aliases, source_query,
+                                                          creator.get("name", ""), search_terms)
                 except (SourceError, ValueError) as exc:
                     warnings.append(f"{creator.get('name', '제작자')}: {exc}")
+                    source_candidates = []
+                if (not source_candidates and _host(source).endswith(".tistory.com")
+                        and source_query.episode is not None):
+                    try:
+                        source_candidates = self._tistory_offset_candidates(source, subject, source_query, creator)
+                    except (SourceError, ValueError) as exc:
+                        warnings.append(f"{creator.get('name', '제작자')}: 통산 화수 확인 실패: {exc}")
+                found.extend(source_candidates)
         if not found or (query.episode is not None and not any(candidate.confidence == "exact" for candidate in found)):
             google_query = (Query(query.title, query.language,
                                   query.season or season_of(works[0]["subject"]), query.episode, query.slug)

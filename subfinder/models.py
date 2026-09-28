@@ -17,6 +17,12 @@ class Anime:
     original_subject: str = ""
 
 
+@dataclass(frozen=True)
+class CreatorBlog:
+    creator: str
+    url: str
+
+
 @dataclass
 class AnimeSearchResult:
     anime: list[Anime] = field(default_factory=list)
@@ -40,6 +46,7 @@ class Candidate:
     file_id: int | None = None
     page_title: str = ""
     require_episode: bool = False
+    source_episode: int | None = None  # Number printed on the source, if it differs from the season episode.
 
     @property
     def key(self) -> str:

@@ -183,6 +183,11 @@ class Downloader:
         # A browse-all search has no episode in its query; the selected result
         # still identifies the episode to check inside an archive.
         requested_episode = query.episode if query.episode is not None else candidate.episode
+        if (candidate.source_episode is not None
+                and (candidate.source_episode <= 0 or candidate.episode != requested_episode
+                     or query.season not in (None, candidate.season))):
+            raise SourceError("시즌별 화수와 원문 통산 화수 후보가 현재 요청과 다름. 다시 검색해 줘")
+        source_episode = candidate.source_episode if candidate.source_episode is not None else requested_episode
         if candidate.file_id is not None:
             data, name = self.opensubtitles.download(candidate)
         else:
@@ -199,20 +204,20 @@ class Downloader:
             raise SourceError("빈 파일 또는 크기 제한 초과")
         suffix = _extension(data, name)
         note = ""
-        if candidate.file_id is None and requested_episode is not None and suffix not in ARCHIVES:
+        if candidate.file_id is None and source_episode is not None and suffix not in ARCHIVES:
             file_episode = filename_episode(name)
-            if file_episode is not None and file_episode != requested_episode:
+            if file_episode is not None and file_episode != source_episode:
                 raise SourceError("첨부 파일의 화 정보가 요청과 다름")
         allow_special = is_special(query.title)
         if suffix == ".zip":
-            item = _zip_selection(data, requested_episode, allow_special, candidate.require_episode)
+            item = _zip_selection(data, source_episode, allow_special, candidate.require_episode)
             if item:
                 data, name = item
                 suffix = _extension(data, name)
             else:
                 note = "압축 안에서 자막 한 개를 확정하지 못해 원본 ZIP 저장"
         elif suffix in (".7z", ".rar"):
-            item = _seven_zip_selection(data, suffix, requested_episode, allow_special,
+            item = _seven_zip_selection(data, suffix, source_episode, allow_special,
                                         candidate.require_episode)
             if item:
                 data, name = item
@@ -223,10 +228,12 @@ class Downloader:
             raise SourceError("자막 파일 크기가 제한을 초과함")
         original = safe_name(Path(name.replace("\\", "/")).name)
         base = safe_name(query.title, "Untitled")
-        folder = self.output / base / (f"Season {query.season:02d}" if query.season else "Unsorted")
+        chosen_season = query.season if query.season is not None else (
+            candidate.season if candidate.source_episode is not None else None)
+        folder = self.output / base / (f"Season {chosen_season:02d}" if chosen_season else "Unsorted")
         folder.mkdir(parents=True, exist_ok=True)
         chosen_episode = requested_episode
-        prefix = f"S{query.season:02d}E{chosen_episode:02d} - " if query.season and chosen_episode else ""
+        prefix = f"S{chosen_season:02d}E{chosen_episode:02d} - " if chosen_season and chosen_episode else ""
         stem = safe_name(Path(original).stem)[:80]
         filename = prefix + stem + suffix
         target = folder / filename
@@ -239,7 +246,9 @@ class Downloader:
             handle.write(data)
         meta = {"provider": candidate.provider, "source_url": candidate.source_url,
                 "download_url": candidate.download_url, "original_filename": name,
-                "title": query.title, "season": query.season, "episode": chosen_episode,
+                "title": query.title, "season": chosen_season, "episode": chosen_episode,
                 "language": candidate.language, "note": note}
+        if candidate.source_episode is not None:
+            meta["source_episode"] = candidate.source_episode
         target.with_name(target.name + ".source.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         return target, note
