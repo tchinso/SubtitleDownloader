@@ -7,7 +7,7 @@ from subfinder.gui import App
 from subfinder.models import Candidate, Query, SearchResult
 
 
-class GoogleFailureHelpTests(unittest.TestCase):
+class SearchControlsTests(unittest.TestCase):
     def setUp(self):
         try:
             self.root = tk.Tk()
@@ -20,39 +20,50 @@ class GoogleFailureHelpTests(unittest.TestCase):
         if hasattr(self, "root"):
             self.root.destroy()
 
-    def test_failed_google_search_shows_url_for_submitted_query(self):
-        self.app.current_query = Query("선택 작품", episode=7)
-        self.app.title.set("나중에 입력한 작품")
-        self.app.episode.set("9")
-        result = SearchResult(status="error", warnings=[
-            "Google 공개 검색: Google 검색 결과 형식을 읽지 못함. 브라우저에서 직접 확인해 줘"
-        ])
-        self.app.events.put((self.app.generation, "done", ("search", result)))
+    def test_three_primary_buttons_are_source_specific(self):
+        self.assertEqual(self.app.search_button.cget("text"), "애니시아 작품 찾기")
+        self.assertEqual(self.app.bigfile_button.cget("text"), "Bigfile 검색 (영문)")
+        self.assertEqual(self.app.open_button.cget("text"), "OpenSubtitles 검색 (영문)")
 
-        self.app._poll()
+        self.app.title.set("책벌레의 하극상")
+        self.app.language.set("en")
+        with patch.object(self.app, "_run") as run, patch.object(self.app.reanime, "discover") as discover:
+            self.app.search()
+            self.assertEqual(run.call_args.args[1]()[0], "anime")
+            discover.assert_called_once_with("책벌레의 하극상")
 
-        self.assertEqual(self.app.google_help.winfo_manager(), "pack")
+    def test_google_search_opens_only_when_user_asks(self):
+        self.app.title.set("선택 작품")
+        self.app.episode.set("7")
         expected = "https://www.google.com/search?hl=ko&q=%EC%84%A0%ED%83%9D+%EC%9E%91%ED%92%88+7%ED%99%94+%EC%9E%90%EB%A7%89"
-        self.assertEqual(self.app.google_url.get(), expected)
-        self.assertIn("직접 열어 주세요", self.app.status.get())
         with patch("subfinder.gui.webbrowser.open") as open_browser:
-            self.app.open_google_result()
+            self.app.google_open()
             open_browser.assert_called_once_with(expected)
-        self.app.copy_google_url()
-        self.assertEqual(self.root.clipboard_get(), expected)
 
-        self.app.events.put((self.app.generation, "done", ("search", SearchResult(status="empty"))))
-        self.app._poll()
-        self.assertEqual(self.app.google_help.winfo_manager(), "")
+    def test_opensubtitles_uses_english_title_without_merging_previous_results(self):
+        self.app.title.set("책벌레의 하극상")
+        self.app.episode.set("22")
+        self.app.language.set("en")
+        self.app.results = SearchResult([Candidate("ReAnime", "old", "old.ass", "https://example.com")])
+        with patch("subfinder.gui.simpledialog.askstring", return_value="Ascendance of a Bookworm"), \
+                patch.object(self.app, "_run") as run, \
+                patch.object(self.app.engine, "search_open", return_value=SearchResult()) as search_open:
+            self.app.search_open()
+            self.assertEqual(run.call_args.args[1]()[0], "search")
+            search_open.assert_called_once_with(Query("Ascendance of a Bookworm", language="en", episode=22))
+        self.assertEqual(self.app.title.get(), "책벌레의 하극상")
 
     def test_bigfile_uses_english_title_and_opens_login_site_for_download(self):
         self.app.title.set("책벌레의 하극상")
         self.app.episode.set("22")
         with patch("subfinder.gui.simpledialog.askstring", return_value="Ascendance of a Bookworm"), \
-                patch.object(self.app, "_run") as run:
+                patch.object(self.app, "_run") as run, \
+                patch.object(self.app.engine, "search_bigfile", return_value=SearchResult()) as search_bigfile:
             self.app.search_bigfile()
+            self.assertEqual(run.call_args.args[1]()[0], "search")
+            search_bigfile.assert_called_once_with(self.app.current_query)
         self.assertEqual(self.app.current_query, Query("Ascendance of a Bookworm", episode=22))
-        run.assert_called_once()
+        self.assertEqual(self.app.title.get(), "책벌레의 하극상")
         candidate = Candidate("Bigfile", "Ascendance of a Bookworm", "Bookworm 22.smi",
                               "https://www.bigfile.co.kr/content/freecaption.php?cateGory=0005")
         self.app.results = SearchResult([candidate], status="found")

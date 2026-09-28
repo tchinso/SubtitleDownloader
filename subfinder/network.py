@@ -19,7 +19,7 @@ def _request_url(url: str) -> str:
 
 EXACT_HOSTS = {
     "reanime.to", "api.anissia.net", "graphql.anilist.co", "www.wikidata.org",
-    "www.google.com", "blog.naver.com", "m.blog.naver.com",
+    "blog.naver.com", "m.blog.naver.com",
     "download.blog.naver.com", "blogfiles.pstatic.net", "blog.kakaocdn.net",
     "drive.google.com", "drive.usercontent.google.com",
     "api.opensubtitles.com", "www.opensubtitles.com",

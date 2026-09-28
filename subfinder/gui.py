@@ -67,17 +67,17 @@ class App:
         ttk.Label(top, text="화수").grid(row=1, column=2, sticky="e")
         self.episode = tk.StringVar()
         ttk.Entry(top, width=8, textvariable=self.episode).grid(row=1, column=3, sticky="w", padx=6)
-        ttk.Label(top, text="언어").grid(row=1, column=4, sticky="e")
+        ttk.Label(top, text="OpenSubtitles 언어").grid(row=1, column=4, sticky="e")
         self.language = tk.StringVar(value="ko")
         ttk.Combobox(top, textvariable=self.language, width=9, values=("ko", "ja", "en", "zh", "es", "fr", "de"), state="readonly").grid(row=1, column=5, sticky="w", padx=6)
         top.columnconfigure(1, weight=1)
         actions = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         actions.pack(fill="x")
-        self.search_button = ttk.Button(actions, text="작품 찾기", command=self.search)
+        self.search_button = ttk.Button(actions, text="애니시아 작품 찾기", command=self.search)
         self.search_button.pack(side="left", padx=(0, 6))
-        self.title_search_button = ttk.Button(actions, text="입력 제목으로 자막 검색", command=self.search_title)
-        self.title_search_button.pack(side="left", padx=6)
-        self.open_button = ttk.Button(actions, text="OpenSubtitles에서도 검색", command=self.search_open)
+        self.bigfile_button = ttk.Button(actions, text="Bigfile 검색 (영문)", command=self.search_bigfile)
+        self.bigfile_button.pack(side="left", padx=6)
+        self.open_button = ttk.Button(actions, text="OpenSubtitles 검색 (영문)", command=self.search_open)
         self.open_button.pack(side="left", padx=6)
         self.download_button = ttk.Button(actions, text="선택 자막 다운로드", command=self.download)
         self.download_button.pack(side="left", padx=6)
@@ -89,22 +89,15 @@ class App:
         self.status = tk.StringVar(value="키워드로 작품을 찾은 뒤 작품을 선택해 자막을 검색해 줘")
         ttk.Label(self.root, textvariable=self.status, padding=(12, 0, 12, 7)).pack(anchor="w")
 
-        self.google_help = ttk.Frame(self.root, padding=(12, 0, 12, 8))
-        ttk.Label(self.google_help, text="Google 자동 검색을 확인할 수 없습니다. 직접 검색한 뒤 게시글 주소를 아래 링크 칸에 붙여넣어 주세요.").pack(anchor="w")
-        google_actions = ttk.Frame(self.google_help)
-        google_actions.pack(fill="x", pady=(4, 0))
-        self.google_url = tk.StringVar()
-        ttk.Entry(google_actions, textvariable=self.google_url, state="readonly").pack(side="left", fill="x", expand=True)
-        ttk.Button(google_actions, text="Google 검색 열기", command=self.open_google_result).pack(side="left", padx=(8, 0))
-        ttk.Button(google_actions, text="URL 복사", command=self.copy_google_url).pack(side="left", padx=(6, 0))
-
         anime_bar = ttk.Frame(self.root, padding=(12, 0, 12, 4))
         self.anime_bar = anime_bar
         anime_bar.pack(fill="x")
         ttk.Label(anime_bar, text="검색된 작품").pack(side="left")
+        self.title_search_button = ttk.Button(anime_bar, text="입력 제목으로 애니시아 자막 검색", command=self.search_title)
+        self.title_search_button.pack(side="left", padx=10)
         self.anime_search_button = ttk.Button(anime_bar, text="선택 작품 자막 검색", command=self.search_selected,
                                               state="disabled")
-        self.anime_search_button.pack(side="left", padx=10)
+        self.anime_search_button.pack(side="left")
         self.creator_blog_button = ttk.Button(anime_bar, text="선택 작품 원본 블로그 열기",
                                               command=self.open_creator_blog, state="disabled")
         self.creator_blog_button.pack(side="left")
@@ -156,10 +149,8 @@ class App:
 
         other_sources = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         other_sources.pack(fill="x")
-        self.bigfile_button = ttk.Button(other_sources, text="Bigfile 애니 검색 (영문명)", command=self.search_bigfile)
-        self.bigfile_button.pack(side="left")
-        ttk.Button(other_sources, text="선택 원문 열기", command=self.open_source).pack(side="left", padx=(8, 0))
-        ttk.Label(other_sources, text="Bigfile 자막은 사이트에 로그인한 뒤 다운로드할 수 있습니다.").pack(side="left", padx=12)
+        ttk.Button(other_sources, text="선택 원문 열기", command=self.open_source).pack(side="left")
+        ttk.Label(other_sources, text="Bigfile 자막은 로그인 없이 검색할 수 있으며, 다운로드에는 로그인이 필요합니다.").pack(side="left", padx=12)
 
     def _query(self, title_override: str | None = None, language_override: str | None = None) -> Query | None:
         title = (title_override if title_override is not None else self.title.get()).strip()
@@ -174,14 +165,11 @@ class App:
                 return None
             fields.append(int(value) if value else None)
         language = language_override or self.language.get()
-        if language != "ko" and not self.config.get("opensubtitles_api_key"):
-            self.status.set("ReAnime 출처는 한국어 중심임. 다른 언어는 API 키를 등록하고 OpenSubtitles에서 검색해 줘")
         return Query(title=title, language=language, season=fields[0], episode=fields[1])
 
     def _run(self, message: str, task, error_title: str = ""):
         if self.busy:
             return
-        self.google_help.pack_forget()
         self.busy = True
         self.generation += 1
         generation = self.generation
@@ -204,19 +192,15 @@ class App:
     def search(self):
         if self.busy:
             return
-        query = self._query()
+        query = self._query(language_override="ko")
         if not query:
-            return
-        if query.language != "ko":
-            self.current_query = query
-            self._run("OpenSubtitles 검색 중…", lambda: ("search", self.engine.search(query)))
             return
         self._run("애니시아 작품 검색 중…", lambda: ("anime", self.reanime.discover(query.title)))
 
     def search_title(self):
         if self.busy:
             return
-        query = self._query()
+        query = self._query(language_override="ko")
         if not query:
             return
         self.current_query = query
@@ -231,7 +215,7 @@ class App:
         anime = next((a for a in self.anime_results.anime if str(a.anime_no) == selected[0]), None)
         if anime is None:
             return
-        query = self._query()
+        query = self._query(language_override="ko")
         if query is None:
             return
         query = Query(anime.subject, query.language, query.season, query.episode)
@@ -296,12 +280,17 @@ class App:
     def search_open(self):
         if self.busy:
             return
-        query = self._query()
+        entered = self.title.get().strip()
+        initial = entered if entered.isascii() and any("a" <= c.lower() <= "z" for c in entered) else ""
+        english = simpledialog.askstring("OpenSubtitles 검색", "검색할 작품의 영문 제목을 입력해 줘.",
+                                         initialvalue=initial, parent=self.root)
+        if english is None:
+            return
+        query = self._query(title_override=english)
         if not query:
             return
-        existing = self.results if query == self.current_query else SearchResult()
         self.current_query = query
-        self._run("OpenSubtitles 검색 중…", lambda: ("search", self.engine.search_open(query, existing)))
+        self._run("OpenSubtitles 검색 중…", lambda: ("search", self.engine.search_open(query)))
 
     def search_bigfile(self):
         if self.busy:
@@ -435,7 +424,6 @@ class App:
                 self.download_button.configure(state="normal")
                 self.cancel_button.configure(state="disabled")
                 if kind == "error":
-                    self.google_help.pack_forget()
                     title, description = value if isinstance(value, tuple) else ("", value)
                     self.status.set("작업 실패: " + description)
                     if title:
@@ -447,7 +435,6 @@ class App:
                     self.status.set("저장됨: " + str(path) + (" · " + note if note else ""))
                     messagebox.showinfo("다운로드 완료", str(path) + ("\n\n" + note if note else ""))
                 elif operation == "anime":
-                    self.google_help.pack_forget()
                     self.anime_results = outcome
                     self._populate_anime()
                     self.results = SearchResult()
@@ -455,22 +442,15 @@ class App:
                     self._populate()
                     warning = " · " + outcome.warnings[0] if outcome.warnings else ""
                     self.status.set(f"작품 {len(outcome.anime)}개 · 작품을 선택해 자막 검색{warning}" if outcome.anime else
-                                    f"검색된 작품 없음 · 정확한 제목이면 입력 제목으로 자막 검색{warning}")
+                                    f"검색된 작품 없음 · 정확한 제목이면 입력 제목으로 애니시아 자막 검색{warning}")
                 elif operation == "blogs":
                     self._show_creator_blogs(outcome)
                 else:
                     self.results = outcome
                     self._populate()
-                    google_failed = any(item.startswith("Google 공개 검색:") for item in outcome.warnings)
-                    if google_failed and self.current_query:
-                        self.google_url.set(self._google_search_url(self.current_query))
-                        self.google_help.pack(fill="x", before=self.anime_bar)
-                    else:
-                        self.google_help.pack_forget()
                     important = next((item for item in outcome.warnings if item.startswith(
-                        ("OpenSubtitles", "Google 공개 검색", "애니시아 작품 검색", "애니시아 작품 목록"))), None)
-                    warning = (" · Google 자동 검색 실패. 아래에서 검색 결과를 직접 열어 주세요" if google_failed else
-                               " · " + (important or outcome.warnings[0]) if outcome.warnings else "")
+                        ("OpenSubtitles", "Bigfile", "애니시아 작품 검색", "애니시아 작품 목록"))), None)
+                    warning = " · " + (important or outcome.warnings[0]) if outcome.warnings else ""
                     self.status.set(f"후보 {len(outcome.candidates)}개{warning}")
         except Empty:
             pass
@@ -534,15 +514,6 @@ class App:
         from urllib.parse import urlencode
         words = f"{query.title} {str(query.episode) + '화 ' if query.episode else ''}자막"
         return "https://www.google.com/search?" + urlencode({"hl": "ko", "q": words})
-
-    def open_google_result(self):
-        if self.google_url.get():
-            webbrowser.open(self.google_url.get())
-
-    def copy_google_url(self):
-        if self.google_url.get():
-            self.root.clipboard_clear()
-            self.root.clipboard_append(self.google_url.get())
 
     def close(self):
         self.root.destroy()

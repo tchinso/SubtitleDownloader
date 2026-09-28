@@ -220,59 +220,39 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(len(result.candidates), 1)
         self.assertEqual(result.candidates[0].source_url, "https://maker.tistory.com/entry/one")
 
-    def test_unreadable_google_page_is_an_error_not_a_confirmed_miss(self):
+    def test_missing_anissia_work_does_not_request_google(self):
         http = FakeHttp()
         http.json["https://api.anissia.net/anime/list/0?q=%EC%98%88%EC%8B%9C"] = {
             "data": {"content": []}}
         http.json["https://api.anissia.net/anime/list/0"] = {
             "data": {"content": [], "totalPages": 1}}
-        http.html["https://www.google.com/search?hl=ko&q=%EC%98%88%EC%8B%9C+1%ED%99%94+%EC%9E%90%EB%A7%89"] = "<html>unrecognized layout</html>"
 
         result = ReAnime(http).search(Query("예시", episode=1))
 
-        self.assertEqual(result.status, "error")
-        self.assertTrue(any("Google" in warning for warning in result.warnings))
+        self.assertEqual(result.status, "empty")
+        self.assertFalse(any("www.google.com" in url for _, url, _ in http.calls))
 
     def test_optional_title_lookup_failure_does_not_call_open(self):
         http = FakeHttp()
         http.json["https://api.anissia.net/anime/list/0?q=Example"] = {"data": {"content": []}}
         http.json["https://api.anissia.net/anime/list/0"] = {"data": {"content": [], "totalPages": 1}}
-        http.html["https://www.google.com/search?hl=ko&q=Example+%EC%9E%90%EB%A7%89"] = "<html>did not match any documents</html>"
         open_source = Mock(search=Mock(return_value=SearchResult(status="empty")))
         result = SearchEngine(ReAnime(http), open_source).search(Query("Example"))
         self.assertEqual(result.status, "empty")
         open_source.search.assert_not_called()
         self.assertTrue(any("AniList" in warning for warning in result.warnings))
+        self.assertFalse(any("www.google.com" in url for _, url, _ in http.calls))
 
-    def test_entire_google_fallback_search_and_download(self):
+    def test_selected_work_without_creator_posts_does_not_request_google(self):
         http = FakeHttp()
-        http.json["https://api.anissia.net/anime/list/0?q=Example"] = {"data": {"content": []}}
-        http.json["https://api.anissia.net/anime/list/0"] = {"data": {"content": [], "totalPages": 1}}
-        google = "https://www.google.com/search?hl=ko&q=Example+1%ED%99%94+%EC%9E%90%EB%A7%89"
-        http.html[google] = '<a href="https://maker.tistory.com/123"><h3>Example 01화 자막</h3></a>'
-        http.html["https://maker.tistory.com/123"] = '<meta property="og:title" content="Example 01화 자막"><a href="https://blog.kakaocdn.net/file/01.srt">자막</a>'
-        http.binary["https://blog.kakaocdn.net/file/01.srt"] = Response(b"1\n00:00:01,000 --> 00:00:02,000\nHello", "https://blog.kakaocdn.net/file/01.srt", {})
-        other = Mock(search=Mock())
-        result = SearchEngine(ReAnime(http), other).search(Query("Example", season=1, episode=1))
-        self.assertEqual(len(result.candidates), 1)
-        other.search.assert_not_called()
-        with tempfile.TemporaryDirectory() as folder:
-            target, note = Downloader(Path(folder) / "subtitles", http).download(result.candidates[0], Query("Example", season=1, episode=1))
-            self.assertIn(b"Hello", target.read_bytes())
-            self.assertEqual(note, "")
+        http.json["https://api.anissia.net/anime/caption/animeNo/12"] = {"data": []}
 
-    def test_google_continues_when_first_result_has_no_subtitle_file(self):
-        http = FakeHttp()
-        http.json["https://api.anissia.net/anime/list/0?q=%EC%98%88%EC%8B%9C"] = {"data": {"content": []}}
-        http.json["https://api.anissia.net/anime/list/0"] = {"data": {"content": [], "totalPages": 1}}
-        http.html["https://www.google.com/search?hl=ko&q=%EC%98%88%EC%8B%9C+1%ED%99%94+%EC%9E%90%EB%A7%89"] = '<a href="https://maker.tistory.com/123"><h3>예시 1화 자막</h3></a>'
-        http.html["https://maker.tistory.com/123"] = '<meta property="og:title" content="예시 1화 자막">'
-        http.html["https://maker.tistory.com/search/%EC%98%88%EC%8B%9C"] = '<html>No matching posts</html>'
-        http.html["https://www.google.com/search?hl=ko&q=%EC%98%88%EC%8B%9C+%EC%9E%90%EB%A7%89"] = '<a href="https://maker2.tistory.com/456"><h3>예시 1화 자막</h3></a>'
-        http.html["https://maker2.tistory.com/456"] = '<meta property="og:title" content="예시 1화 자막"><a href="https://blog.kakaocdn.net/file/01.srt">자막</a>'
-        result = ReAnime(http).search(Query("예시", episode=1))
-        self.assertEqual(len(result.candidates), 1)
-        self.assertEqual(result.candidates[0].source_url, "https://maker2.tistory.com/456")
+        result = ReAnime(http).search_selected(
+            Query("Example", episode=1), Anime(12, "Example"))
+
+        self.assertEqual(result.status, "empty")
+        self.assertEqual(result.candidates, [])
+        self.assertFalse(any("www.google.com" in url for _, url, _ in http.calls))
 
     def test_manual_title_reads_anissia_and_naver_attachment_without_reanime_site(self):
         http = FakeHttp()
@@ -380,7 +360,8 @@ class DownloadTests(unittest.TestCase):
                     Query("Example", episode=2))
 
     def test_rejects_non_https_and_private_hosts(self):
-        for url in ("http://example.com/01.srt", "https://127.0.0.1/x", "https://evil.com/x", "https://user:secret@blog.naver.com/x"):
+        for url in ("http://example.com/01.srt", "https://127.0.0.1/x", "https://evil.com/x",
+                    "https://www.google.com/search?q=anime", "https://user:secret@blog.naver.com/x"):
             self.assertFalse(allowed_url(url))
 
     def test_korean_source_path_is_encoded_once_for_urllib(self):

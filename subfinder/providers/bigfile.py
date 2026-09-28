@@ -8,7 +8,7 @@ from html.parser import HTMLParser
 from pathlib import PurePosixPath
 import re
 
-from ..matching import ARCHIVES, FORMATS, filename_episode, season_of
+from ..matching import ARCHIVES, FORMATS, filename_episode, normal, season_of
 from ..models import Candidate, Query, SearchResult
 from ..network import HttpClient, SourceError
 
@@ -73,6 +73,49 @@ class Bigfile:
         if not re.search(r"[a-z]", term, re.I):
             return SearchResult(status="error", warnings=["빅파일 애니 검색에는 영문 작품명을 입력해 줘"])
 
+        result = self._search_term(query, term)
+        if result.status != "empty":
+            return result
+
+        # Bigfile indexes filenames, which commonly use the Japanese romaji
+        # title even when a user enters the official English title.
+        aliases, alias_warnings = self._romaji_aliases(term)
+        for alias in aliases:
+            alternative = self._search_term(query, alias)
+            if alternative.status == "found":
+                alternative.warnings.insert(0, f"빅파일에 '{term}' 결과가 없어 '{alias}'로 검색했어")
+                alternative.warnings.extend(alias_warnings)
+                return alternative
+            if alternative.status == "error":
+                alternative.warnings.extend(alias_warnings)
+                return alternative
+        result.warnings.extend(alias_warnings)
+        return result
+
+    def _romaji_aliases(self, term: str) -> tuple[list[str], list[str]]:
+        gql = ('query ($search: String!) { Page(perPage: 10) {'
+               ' media(search: $search, type: ANIME) { title { english romaji native } synonyms } } }')
+        try:
+            data = self.http.get_json("https://graphql.anilist.co", method="POST",
+                                      payload={"query": gql, "variables": {"search": term}})
+            media = ((data.get("data") or {}).get("Page") or {}).get("media") or []
+            exact = []
+            for entry in media:
+                title = entry.get("title") or {}
+                values = list(title.values()) + (entry.get("synonyms") or [])
+                if any(isinstance(value, str) and normal(value) == normal(term) for value in values):
+                    exact.append(title.get("romaji"))
+            if len(exact) != 1 or not isinstance(exact[0], str):
+                return [], []
+            romaji = exact[0].strip()
+            variants = [romaji, romaji.split(":", 1)[0].strip()]
+            return list(dict.fromkeys(value for value in variants
+                                      if value and re.search(r"[a-z]", value, re.I)
+                                      and normal(value) != normal(term))), []
+        except (SourceError, AttributeError, TypeError, ValueError) as exc:
+            return [], [f"AniList 영문명 별칭 확인: {exc}"]
+
+    def _search_term(self, query: Query, term: str) -> SearchResult:
         found: list[Candidate] = []
         warnings: list[str] = []
         seen: set[tuple[str, str]] = set()
@@ -108,7 +151,7 @@ class Bigfile:
                         continue
                     confidence = "exact" if query.episode is not None and episode == query.episode else "review"
                     found.append(Candidate(
-                        provider="Bigfile", title=term, file_name=filename,
+                        provider="Bigfile", title=query.title, file_name=filename,
                         source_url=self.PAGE, language="ko", season=season,
                         episode=episode if isinstance(episode, int) else None,
                         confidence=confidence,

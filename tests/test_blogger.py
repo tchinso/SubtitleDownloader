@@ -107,17 +107,5 @@ class BloggerEpisodeTests(unittest.TestCase):
                 self.assertEqual(match[0].confidence, "review")
                 self.assertTrue(match[0].require_episode)
 
-    def test_google_parse_warning_includes_search_link(self):
-        http = FakeHttp()
-        query = Query(TITLE, episode=22)
-        address = "https://www.google.com/search?" + urlencode(
-            {"hl": "ko", "q": f"{TITLE} 22화 자막"})
-        http.html[address] = "<title>Google Search</title><script src='/httpservice/retry/enablejs'></script>"
-        warnings = []
-        self.assertEqual(list(ReAnime(http)._google([TITLE], query, warnings)), [])
-        self.assertIn(address, warnings[0])
-        self.assertTrue(warnings[0].startswith("Google 공개 검색:"))
-
-
 if __name__ == "__main__":
     unittest.main()

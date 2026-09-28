@@ -1,4 +1,4 @@
-"""Anissia + creator blogs, followed by Google public-result discovery.
+"""Anissia and registered creator blogs for public subtitle discovery.
 
 The adapter extracts public attachment links. It does not contain subtitle
 files, reuse the ReAnime extension, or execute scripts from source pages.
@@ -656,42 +656,6 @@ class ReAnime:
             result.status = "review"
         return result
 
-    def _google(self, aliases: list[str], query: Query, warnings: list[str]):
-        seen = set()
-        for name in aliases[:3]:
-            for q in ([f"{name} {query.episode}화 자막", f"{name} 자막"] if query.episode else [f"{name} 자막"]):
-                address = "https://www.google.com/search?" + urlencode({"hl": "ko", "q": q})
-                try:
-                    html = self.http.get_text(address)
-                    if re.search(r"captcha-form|recaptcha|/sorry/|unusual traffic", html, re.I):
-                        raise SourceError(f"Google 자동 검색 제한. 브라우저에서 확인: {address}")
-                    page_urls = []
-                    links = Document(html).links
-                    if (not any(link.heading for link in links)
-                            and not re.search(r"did not match any documents|검색어와 일치하는 문서가 없습니다|검색결과가 없습니다", html, re.I)):
-                        raise SourceError(f"Google 검색 결과 형식을 읽지 못함. 브라우저에서 확인: {address}")
-                    for link in links:
-                        if not link.heading or _post_confidence(
-                                re.sub(r"\s*[-|:]\s*(?:네이버 블로그|티스토리)\s*$", "", link.text),
-                                aliases, query) == "none":
-                            continue
-                        target = urljoin("https://www.google.com", link.href)
-                        if urlsplit(target).path == "/url" and _host(target) == "www.google.com":
-                            params = parse_qs(urlsplit(target).query)
-                            target = params.get("q", params.get("url", [""]))[0]
-                        if _host(target) not in ("blog.naver.com", "m.blog.naver.com") and not _host(target).endswith((".tistory.com", ".blogspot.com")):
-                            continue
-                        if allowed_url(target) and target not in seen:
-                            page_urls.append(target)
-                except SourceError as exc:
-                    warnings.append(f"Google 공개 검색: {exc}")
-                    return
-                for target in page_urls[:6]:
-                    seen.add(target)
-                    yield target
-                if len(seen) >= 12:
-                    return
-
     def search(self, query: Query) -> SearchResult:
         warnings = []
         alias_warnings = []
@@ -754,17 +718,6 @@ class ReAnime:
                     except (SourceError, ValueError) as exc:
                         warnings.append(f"{creator.get('name', '제작자')}: 통산 화수 확인 실패: {exc}")
                 found.extend(source_candidates)
-        if not found or (query.episode is not None and not any(candidate.confidence == "exact" for candidate in found)):
-            google_query = (Query(query.title, query.language,
-                                  query.season or season_of(works[0]["subject"]), query.episode, query.slug)
-                            if len(works) == 1 else query)
-            for url in self._google(names, google_query, warnings):
-                try:
-                    found.extend(self._read_source(url, names, google_query, _host(url)))
-                except (SourceError, ValueError) as exc:
-                    warnings.append(f"{_host(url)}: {exc}")
-                if any(candidate.confidence == "exact" for candidate in found):
-                    break
         unique = list({candidate.key: candidate for candidate in found}.values())
         unique.sort(key=lambda c: (c.confidence != "exact", c.provider, c.title))
         # Alias lookup is advisory; source failures make an empty result incomplete.
