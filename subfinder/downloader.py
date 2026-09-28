@@ -180,6 +180,9 @@ class Downloader:
         return response
 
     def download(self, candidate: Candidate, query: Query) -> tuple[Path, str]:
+        # A browse-all search has no episode in its query; the selected result
+        # still identifies the episode to check inside an archive.
+        requested_episode = query.episode if query.episode is not None else candidate.episode
         if candidate.file_id is not None:
             data, name = self.opensubtitles.download(candidate)
         else:
@@ -196,20 +199,20 @@ class Downloader:
             raise SourceError("빈 파일 또는 크기 제한 초과")
         suffix = _extension(data, name)
         note = ""
-        if candidate.file_id is None and query.episode is not None and suffix not in ARCHIVES:
+        if candidate.file_id is None and requested_episode is not None and suffix not in ARCHIVES:
             file_episode = filename_episode(name)
-            if file_episode is not None and file_episode != query.episode:
+            if file_episode is not None and file_episode != requested_episode:
                 raise SourceError("첨부 파일의 화 정보가 요청과 다름")
         allow_special = is_special(query.title)
         if suffix == ".zip":
-            item = _zip_selection(data, query.episode, allow_special, candidate.require_episode)
+            item = _zip_selection(data, requested_episode, allow_special, candidate.require_episode)
             if item:
                 data, name = item
                 suffix = _extension(data, name)
             else:
                 note = "압축 안에서 자막 한 개를 확정하지 못해 원본 ZIP 저장"
         elif suffix in (".7z", ".rar"):
-            item = _seven_zip_selection(data, suffix, query.episode, allow_special,
+            item = _seven_zip_selection(data, suffix, requested_episode, allow_special,
                                         candidate.require_episode)
             if item:
                 data, name = item
@@ -222,7 +225,7 @@ class Downloader:
         base = safe_name(query.title, "Untitled")
         folder = self.output / base / (f"Season {query.season:02d}" if query.season else "Unsorted")
         folder.mkdir(parents=True, exist_ok=True)
-        chosen_episode = query.episode or candidate.episode
+        chosen_episode = requested_episode
         prefix = f"S{query.season:02d}E{chosen_episode:02d} - " if query.season and chosen_episode else ""
         stem = safe_name(Path(original).stem)[:80]
         filename = prefix + stem + suffix

@@ -92,6 +92,25 @@ class FlowTests(unittest.TestCase):
         first.search.assert_not_called()
         second.search.assert_called_once()
 
+    def test_bigfile_is_explicit_and_does_not_mutate_existing_results(self):
+        reanime = Mock(search=Mock(return_value=SearchResult(status="empty")))
+        open_subtitles = Mock(search=Mock())
+        bigfile = Mock(search=Mock(return_value=SearchResult([
+            Candidate("Bigfile", "Example", "Example 22.smi",
+                      "https://www.bigfile.co.kr/content/freecaption.php", episode=22)],
+            status="found")))
+        engine = SearchEngine(reanime, open_subtitles, bigfile)
+        original = SearchResult([Candidate("ReAnime", "Example", "Example 22.srt",
+                                          "https://maker.tistory.com/22", episode=22)], status="found")
+
+        engine.search(Query("Example", episode=22))
+        bigfile.search.assert_not_called()
+        merged = engine.search_bigfile(Query("Example", episode=22), original)
+
+        self.assertEqual([candidate.provider for candidate in merged.candidates], ["ReAnime", "Bigfile"])
+        self.assertEqual(len(original.candidates), 1)
+        open_subtitles.search.assert_not_called()
+
 
 class SourceTests(unittest.TestCase):
     def test_keyword_discovery_accepts_zero_pages_for_no_matches(self):

@@ -23,6 +23,7 @@ EXACT_HOSTS = {
     "download.blog.naver.com", "blogfiles.pstatic.net", "blog.kakaocdn.net",
     "drive.google.com", "drive.usercontent.google.com",
     "api.opensubtitles.com", "www.opensubtitles.com",
+    "www.bigfile.co.kr",
 }
 
 
@@ -64,15 +65,21 @@ class HttpClient:
         self.opener = urllib.request.build_opener(RestrictedRedirect())
 
     def fetch(self, url: str, *, method: str = "GET", payload: dict | None = None,
+              form: dict[str, str] | None = None,
               headers: dict | None = None, limit: int = 6 * 1024 * 1024) -> Response:
         if not allowed_url(url):
             raise SourceError("지원하는 HTTPS 출처가 아님")
         url = _request_url(url)
         request_headers = {"User-Agent": "SubtitleFinder v0.1.0", "Accept": "*/*"}
         request_headers.update(headers or {})
+        if payload is not None and form is not None:
+            raise ValueError("JSON payload and form data cannot be sent together")
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-        if data is not None:
+        if payload is not None:
             request_headers["Content-Type"] = "application/json"
+        elif form is not None:
+            data = urllib.parse.urlencode(form).encode("ascii")
+            request_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
         req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
         for attempt in range(2):
             try:
@@ -98,6 +105,10 @@ class HttpClient:
 
     def get_bytes(self, url: str, limit: int = 6 * 1024 * 1024) -> Response:
         return self.fetch(url, limit=limit)
+
+    def post_form(self, url: str, form: dict[str, str], *, headers: dict | None = None,
+                  limit: int = 3 * 1024 * 1024) -> Response:
+        return self.fetch(url, method="POST", form=form, headers=headers, limit=limit)
 
     def get_text(self, url: str) -> str:
         response = self.fetch(url, limit=3 * 1024 * 1024)

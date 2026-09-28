@@ -6,6 +6,7 @@ files, reuse the ReAnime extension, or execute scripts from source pages.
 
 import json
 import re
+from dataclasses import replace
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit
 
 from ..htmlparse import Document
@@ -377,51 +378,118 @@ class ReAnime:
                                     source, link.href, season=query.season or season_of(title), episode=query.episode or episode_of(title),
                                     creator=creator, confidence="review", note="Drive 링크의 실제 파일명은 다운로드 때 확인",
                                     require_episode=True))
+        # A numbered post with one matching attachment identifies the requested
+        # episode. Bundles and ambiguous posts still need download-time review.
+        if (query.episode is not None and confidence == "exact" and len(result) == 1
+                and episode_range(title) is None):
+            result[0].confidence = "exact"
+            result[0].require_episode = False
+        elif query.episode is None:
+            numbers = episode_range(title)
+            if numbers and 0 < numbers[1] - numbers[0] < 50:
+                expanded = []
+                for item in result:
+                    stem, suffix = item.file_name.rsplit(".", 1)
+                    for number in range(numbers[0], numbers[1] + 1):
+                        expanded.append(replace(item, file_name=f"{stem} ({number}화).{suffix}",
+                                                episode=number))
+                result = expanded
+        return result
+
+    def _blogger_html_search(self, origin: str, alias: str, aliases: list[str],
+                             query: Query, creator: str):
+        search = f"{origin}/search?{urlencode({'q': alias})}"
+        queue, visited, posts = [search], set(), {}
+        while queue and len(visited) < 10 and len(posts) < 100:
+            page = queue.pop(0)
+            if page in visited:
+                continue
+            visited.add(page)
+            doc = Document(self.http.get_text(page))
+            for link in doc.links:
+                target = urljoin(page, link.href)
+                if _host(target) != _host(origin):
+                    continue
+                parsed = urlsplit(target)
+                if (re.fullmatch(r"/\d{4}/\d{2}/[^/]+\.html", parsed.path)
+                        and _post_confidence(link.text, aliases, query) != "none"):
+                    posts.setdefault(target.split("#")[0].split("?")[0], link.text)
+                if (parsed.path == "/search" and "blog-pager-older-link" in link.attributes.get("class", "")
+                        and parse_qs(parsed.query).get("q") == [alias]
+                        and target not in visited and target not in queue):
+                    queue.append(target)
+            if query.episode is not None and posts:
+                break
+        result = []
+        for post in list(posts)[:100]:
+            try:
+                html = self.http.get_text(post)
+            except SourceError:
+                continue
+            article = Document(html)
+            result.extend(self._blogger_content(html, article.meta.get("og:title") or article.title,
+                                                post, aliases, query, creator))
+            if query.episode is not None and result:
+                break
         return result
 
     def _blogger(self, source: str, aliases: list[str], query: Query, creator: str,
                  search_terms: list[str] | None = None):
         origin = f"https://{_host(source)}"
         result = []
+        errors = []
         if re.fullmatch(r"/\d{4}/\d{2}/[^/]+\.html", urlsplit(source).path):
             try:
                 html = self.http.get_text(source)
                 doc = Document(html)
-                result.extend(self._blogger_content(html, doc.meta.get("og:title", doc.title), source, aliases, query, creator))
-            except SourceError:
-                pass
-            if result:
+                result.extend(self._blogger_content(html, doc.meta.get("og:title") or doc.title,
+                                                    source, aliases, query, creator))
+            except SourceError as exc:
+                errors.append(str(exc))
+            if result and query.episode is not None:
                 return result
         for alias in (search_terms or aliases)[:6]:
-            url = f"{origin}/feeds/posts/default?" + urlencode({"alt": "json", "max-results": 100, "q": alias})
+            found = []
+            feed_failed = False
             try:
-                feed = self.http.get_json(url)
-                for entry in (feed.get("feed") or {}).get("entry") or []:
-                    title = (entry.get("title") or {}).get("$t", "")
-                    page = next((x.get("href", source) for x in entry.get("link", []) if x.get("rel") == "alternate"), source)
-                    result.extend(self._blogger_content((entry.get("content") or {}).get("$t", ""), title, page, aliases, query, creator))
-            except (SourceError, AttributeError, TypeError):
-                search = f"{origin}/search?{urlencode({'q': alias})}"
-                queue, visited = [search], set()
-                while queue and len(visited) < 3:
-                    page = queue.pop(0)
-                    if page in visited:
-                        continue
-                    visited.add(page)
-                    doc = Document(self.http.get_text(page))
-                    for link in doc.links:
-                        target = urljoin(page, link.href)
-                        if _host(target) != _host(origin):
+                start = 1
+                for _ in range(10):
+                    params = {"alt": "json", "max-results": 100, "q": alias}
+                    if start > 1:
+                        params["start-index"] = start
+                    feed = self.http.get_json(f"{origin}/feeds/posts/default?" + urlencode(params))
+                    body = feed.get("feed") or {}
+                    entries = body.get("entry") or []
+                    if not isinstance(entries, list):
+                        raise SourceError("Blogger 피드 형식 오류")
+                    for entry in entries:
+                        title = (entry.get("title") or {}).get("$t", "")
+                        page = next((link.get("href", "") for link in entry.get("link", [])
+                                     if link.get("rel") == "alternate"), "")
+                        if (_host(page) != _host(origin)
+                                or not re.fullmatch(r"/\d{4}/\d{2}/[^/]+\.html", urlsplit(page).path)):
                             continue
-                        if re.fullmatch(r"/\d{4}/\d{2}/[^/]+\.html", urlsplit(target).path) and _post_confidence(link.text, aliases, query) != "none":
-                            html = self.http.get_text(target)
-                            article = Document(html)
-                            result.extend(self._blogger_content(html, article.meta.get("og:title", article.title), target, aliases, query, creator))
-                        if urlsplit(target).path == "/search" and parse_qs(urlsplit(target).query).get("q") == [alias] and target not in visited and len(queue) < 2:
-                            queue.append(target)
-            if result:
+                        found.extend(self._blogger_content((entry.get("content") or {}).get("$t", ""),
+                                                            title, page, aliases, query, creator))
+                    total_text = (body.get("openSearch$totalResults") or {}).get("$t", "")
+                    total = int(total_text) if str(total_text).isdecimal() else None
+                    if not entries or (total is not None and start + len(entries) > total) or (total is None and len(entries) < 100):
+                        break
+                    start += len(entries)
+            except (SourceError, AttributeError, TypeError, ValueError) as exc:
+                errors.append(str(exc))
+                feed_failed = True
+            if feed_failed or not found:
+                try:
+                    found.extend(self._blogger_html_search(origin, alias, aliases, query, creator))
+                except SourceError as exc:
+                    errors.append(str(exc))
+            result.extend(found)
+            if result and query.episode is not None:
                 break
-        return result
+        if not result and errors:
+            raise SourceError("Blogger 검색: " + errors[-1])
+        return list({candidate.key: candidate for candidate in result}.values())
 
     def _read_source(self, source: str, aliases: list[str], query: Query, creator: str,
                      search_terms: list[str] | None = None):
@@ -481,12 +549,12 @@ class ReAnime:
                 try:
                     html = self.http.get_text(address)
                     if re.search(r"captcha-form|recaptcha|/sorry/|unusual traffic", html, re.I):
-                        raise SourceError("Google 자동 검색 제한. 브라우저에서 검색 후 글 주소를 앱에 붙여넣어 줘")
+                        raise SourceError(f"Google 자동 검색 제한. 브라우저에서 확인: {address}")
                     page_urls = []
                     links = Document(html).links
                     if (not any(link.heading for link in links)
                             and not re.search(r"did not match any documents|검색어와 일치하는 문서가 없습니다|검색결과가 없습니다", html, re.I)):
-                        raise SourceError("Google 검색 결과 형식을 읽지 못함. 브라우저에서 직접 확인해 줘")
+                        raise SourceError(f"Google 검색 결과 형식을 읽지 못함. 브라우저에서 확인: {address}")
                     for link in links:
                         if not link.heading or _post_confidence(
                                 re.sub(r"\s*[-|:]\s*(?:네이버 블로그|티스토리)\s*$", "", link.text),
@@ -564,7 +632,7 @@ class ReAnime:
                                                    creator.get("name", ""), search_terms))
                 except (SourceError, ValueError) as exc:
                     warnings.append(f"{creator.get('name', '제작자')}: {exc}")
-        if not any(candidate.confidence == "exact" for candidate in found):
+        if not found or (query.episode is not None and not any(candidate.confidence == "exact" for candidate in found)):
             google_query = (Query(query.title, query.language,
                                   query.season or season_of(works[0]["subject"]), query.episode, query.slug)
                             if len(works) == 1 else query)
