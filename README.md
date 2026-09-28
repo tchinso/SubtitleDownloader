@@ -1,0 +1,54 @@
+# 애니 자막 찾기 0.1.0 초안
+
+작품명을 직접 입력해 공개 자막 파일을 찾는 Windows용 Python 앱이다. 기본 검색 순서는 **애니시아의 제작자 블로그 → Google의 공개 블로그 검색 → 결과가 없을 때 OpenSubtitles**다. 애니시아 또는 블로그에서 후보가 한 개라도 발견되면 OpenSubtitles는 자동 호출하지 않는다. 원하면 `OpenSubtitles에서도 검색` 버튼으로 추가 검색할 수 있다.
+
+## 실행
+
+1. Windows에 Python을 설치하고 설치할 때 `py` 실행기를 활성화한다. 현재 초안은 Python 3.10 이상과 기본 포함된 Tkinter만 사용한다.
+2. ZIP을 한 폴더에 풀고 `run_windows.bat`을 실행한다. `python run.py`도 가능하다.
+3. 작품명을 입력한다. 시즌과 화수는 선택 사항이며, **입력하면 더 정확하게 찾는다**. `자막 검색 (ReAnime 우선)`을 누른다.
+4. 목록에서 파일을 선택하고 `선택 자막 다운로드`를 누른다.
+
+검색 중 `취소`를 누르면 화면 대기를 종료한다. 이미 시작한 HTTPS 요청은 타임아웃까지 백그라운드에서 진행될 수 있다.
+
+`subtitles/<작품명>/Season 01/`에 저장한다. 시즌을 입력하지 않으면 `Unsorted/`에 저장한다. 같은 이름이 이미 있으면 `(2)`처럼 번호를 붙인다. 각 파일 옆의 `.source.json`에 다운로드 출처를 기록한다.
+
+작품명만 입력하면 전체 시즌이 검색될 수 있다. 목록의 시즌·화수·제작자를 보고 파일을 골라야 한다. 확실하지 않은 압축파일은 원본 그대로 저장한다. ZIP은 자막이 단일 파일로 특정되면 안에서 꺼낸다. 7z/RAR은 Windows에 7-Zip이 설치돼 있으면 단일 자막 추출을 시도하고, 그렇지 않으면 원본 압축파일을 저장한다.
+
+## 출처와 작동 순서
+
+- ReAnime 방식: `api.anissia.net/anime/list/0?q=...`에서 작품 식별 → `/anime/caption/animeNo/{id}`에서 등록된 자막 제작자 블로그 확인 → 네이버·티스토리·Blogger의 공개 첨부 검색. 네이버 첨부 서버, Kakao CDN, Google Drive 링크에서 파일을 받는다. 영문/일문명만 입력하면 AniList와 Wikidata에서 제목 별칭을 확인한다.
+- 위 경로에 결과가 없으면 앱이 Python HTTPS 요청으로 Google의 `작품명 [화수] 자막` 검색 결과를 확인하고 지원 블로그 글을 검사한다. Google이 자동 검색을 제한하면 검색 실패를 표시한다. `Google 직접 열기`로 브라우저에서 검색하고 찾은 게시글 주소를 앱의 링크 입력칸에 붙여넣을 수 있다.
+- ReAnime 방식의 검색이 **정상 완료됐지만 후보가 없으면** OpenSubtitles REST API를 자동 검색한다. 제작자 사이트가 오류나 접근 차단을 반환한 경우는 자막 부재로 확정하지 않고 오류를 표시한다. `OpenSubtitles에서도 검색` 버튼은 언제든 쓸 수 있다.
+- 다른 언어를 선택하면 OpenSubtitles로 바로 검색한다. ReAnime 쪽은 한국어 자막 제작자 출처 중심이다.
+
+OpenSubtitles 검색에는 본인 API 키가 필요하다. [공식 시작 안내](https://opensubtitles.stoplight.io/docs/opensubtitles-api/e3750fd63a100-getting-started)를 확인하고 앱의 `OpenSubtitles API 키` 버튼에서 저장한다. 제공된 WebSubtitle 확장의 API 키를 복사하거나 이 프로그램에 내장하지 않았다. 저장한 키는 `settings.json`에 로컬로 보관하며 API 요청 헤더에만 사용한다. API 키가 없으면 ReAnime 검색 결과는 볼 수 있고 OpenSubtitles 단계에서 설정 안내가 뜬다.
+
+## 엣지 확장 연결 (선택)
+
+**수동 작품명 검색에는 엣지가 필요 없다.** 엣지 확장은 브라우저의 현재 탭 제목이나 지원 블로그 주소를 앱에 입력하는 보조 수단이다.
+
+1. 앱을 실행해 하단에 표시되는 `엣지 연동 코드`를 복사한다.
+2. 엣지의 `edge://extensions`에서 개발자 모드를 켜고 `압축 풀린 항목 로드`로 ZIP 안의 `edge-companion` 폴더를 선택한다.
+3. 확장 아이콘을 열어 연동 코드를 붙여넣고 `연결 확인`을 누른다. 이후 `현재 탭 보내기`를 누르면 앱에 제목 또는 게시글 주소가 채워진다.
+
+확장은 현재 탭 정보를 **내 컴퓨터의 `127.0.0.1:48741`에만** 전송한다. 앱은 이 주소에서만 대기하며 연동 코드가 맞는 요청만 받는다. 방화벽이나 보안 도구가 연결을 막아도 작품명을 앱에서 직접 입력하면 된다. 엣지 확장으로 Google 검색 결과를 대신 수집하는 기능은 없다.
+
+## 명령줄 및 EXE
+
+```bat
+py -3 run.py "강철의 연금술사" --season 1 --episode 1
+py -3 run.py "Steins;Gate" --open-only --language ko
+py -3 run.py "강철의 연금술사" --season 1 --episode 1 --download 1
+```
+
+Windows에서 EXE가 필요해지면 `build_windows.bat`을 실행한다. PyInstaller가 설치되고 `dist/AnimeSubtitleFinder.exe`가 만들어진다. 그 EXE와 `edge-companion` 폴더를 함께 두면 되고, 실행 파일 옆에 `subtitles/`가 만들어진다. 지금 제공하는 ZIP은 **Python 소스 초안**이며 Windows/Edge 실제 실행과 외부 사이트의 실시간 다운로드는 아직 검증되지 않았다.
+
+구현 범위와 Windows 확인 순서는 [PLAN.md](PLAN.md)를 참고하면 된다. 코드의 모의 응답 테스트는 `py -3 -m unittest discover -s tests -v`로 실행한다.
+
+## 제한과 소스
+
+- 공개 게시글과 공개 파일만 처리한다. 제작자 사이트 구조 변경, Google CAPTCHA, 로그인이 필요한 첨부파일은 결과가 없거나 오류가 날 수 있다.
+- HTML/파일 응답은 크기 제한을 두고, 지원 출처의 HTTPS 링크만 자동 다운로드한다. ZIP 내부 파일도 요청 화수에 맞는 자막 하나가 확정될 때만 추출한다.
+- 출력 형식은 SRT, SMI/SAMI, VTT, ASS/SSA 또는 ZIP, 7z, RAR이다. 별도 영상 다운로드 기능은 없다.
+- 이 코드는 두 확장 프로그램에서 **검색 경로와 아이디어를 참고해 새로 작성한 초안**이다. 원본 확장 코드와 원본 자막 파일을 ZIP에 포함하지 않는다.
