@@ -11,7 +11,7 @@ from dataclasses import replace
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit
 
 from ..htmlparse import Document
-from ..matching import (drive_id, episode_of, episode_range, file_name_from_url,
+from ..matching import (blog_title_alias, drive_id, episode_of, episode_range, file_name_from_url,
                         is_special, matching_post, matching_public_title, normal, season_of, suitable_file,
                         title_queries, without_mixed_specials)
 from ..models import Anime, AnimeSearchResult, Candidate, CreatorBlog, Query, SearchResult
@@ -77,6 +77,15 @@ def _post_confidence(title: str, aliases: list[str], query: Query) -> str:
     # Whole-series posts may contain a numbered attachment; keep those for review.
     return ("review" if matching_public_title(title, aliases, query.season,
                                                query.episode) != "none" else "none")
+
+
+def _blog_search_titles(title: str, aliases: list[str], query: Query,
+                        search_terms: list[str] | None):
+    """Use the registered post's confirmed short name only for this creator."""
+    short = blog_title_alias(title, aliases, query.season)
+    if short:
+        return list(dict.fromkeys([*aliases, short])), [short]
+    return aliases, search_terms
 
 
 def _family_title(title: str) -> str:
@@ -268,7 +277,7 @@ class ReAnime:
             scored = [(score, item) for score, item in scored if score == 0]
         return [item for _, item in sorted(scored, key=lambda p: p[0])]
 
-    def _candidates_from_naver_post(self, url: str, aliases: list[str], query: Query, creator: str):
+    def _naver_post_document(self, url: str):
         html = self.http.get_text(url)
         doc = Document(html)
         for frame in doc.frames:
@@ -277,7 +286,12 @@ class ReAnime:
                 html = self.http.get_text(target)
                 doc = Document(html)
                 break
-        title = doc.meta.get("og:title", "")
+        return html, doc
+
+    def _candidates_from_naver_post(self, url: str, aliases: list[str], query: Query, creator: str,
+                                    post_data: tuple[str, Document] | None = None):
+        html, doc = post_data if post_data is not None else self._naver_post_document(url)
+        title = doc.meta.get("og:title") or doc.title
         confidence = _post_confidence(title, aliases, query)
         if confidence == "none":
             return []
@@ -313,7 +327,11 @@ class ReAnime:
         if not canonical:
             return []
         try:
-            result = self._candidates_from_naver_post(canonical, aliases, query, creator)
+            post_data = self._naver_post_document(canonical)
+            doc = post_data[1]
+            aliases, search_terms = _blog_search_titles(doc.meta.get("og:title") or doc.title,
+                                                        aliases, query, search_terms)
+            result = self._candidates_from_naver_post(canonical, aliases, query, creator, post_data)
         except SourceError:
             result = []  # A deleted latest post need not hide the creator's other posts.
         if result and query.episode is not None:
@@ -352,10 +370,11 @@ class ReAnime:
                     return list({candidate.key: candidate for candidate in result}.values())
         return list({candidate.key: candidate for candidate in result}.values())
 
-    def _tistory_post(self, url: str, aliases: list[str], query: Query, creator: str):
-        html = self.http.get_text(url)
-        doc = Document(html)
-        title = doc.meta.get("og:title", "")
+    def _tistory_post(self, url: str, aliases: list[str], query: Query, creator: str,
+                       doc: Document | None = None):
+        if doc is None:
+            doc = Document(self.http.get_text(url))
+        title = doc.meta.get("og:title") or doc.title
         confidence = _post_confidence(title, aliases, query)
         if confidence == "none":
             return []
@@ -381,7 +400,10 @@ class ReAnime:
         seen_posts = set()
         if re.fullmatch(r"/(?:\d+|entry/[^/]+)/?", parsed.path):
             try:
-                result.extend(self._tistory_post(source, aliases, query, creator))
+                doc = Document(self.http.get_text(source))
+                aliases, search_terms = _blog_search_titles(doc.meta.get("og:title") or doc.title,
+                                                            aliases, query, search_terms)
+                result.extend(self._tistory_post(source, aliases, query, creator, doc))
             except SourceError:
                 pass
             if result and query.episode is not None:
@@ -557,6 +579,8 @@ class ReAnime:
             try:
                 html = self.http.get_text(source)
                 doc = Document(html)
+                aliases, search_terms = _blog_search_titles(doc.meta.get("og:title") or doc.title,
+                                                            aliases, query, search_terms)
                 result.extend(self._blogger_content(html, doc.meta.get("og:title") or doc.title,
                                                     source, aliases, query, creator))
             except SourceError as exc:

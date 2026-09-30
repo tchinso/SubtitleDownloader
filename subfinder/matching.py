@@ -84,17 +84,23 @@ def filename_episode(name: str) -> int | float | None:
     return None
 
 
+def _has_title_identity(text: str) -> bool:
+    """Season, sequel, and special markers must survive title shortening."""
+    return bool(season_of(text) or is_special(text) or re.search(
+        r"\b(?:[A-Z]|[IVX]{2,4}|Part|Cour)\b|극장판", text, re.I))
+
+
 def title_queries(subject: str, aliases=()) -> list[str]:
     """Search full title, a safe subtitle omission, and confirmed Korean aliases."""
     titles = [subject, *(alias for alias in aliases if isinstance(alias, str) and re.search(r"[가-힣]", alias))]
 
     def shortened(title: str) -> str | None:
-        match = (re.match(r"^(.*?)\s+[~～〜][^~～〜]+[~～〜]\s*$", title)
+        match = (re.match(r"^(.*?)\s+[~～〜]+[^~～〜]+[~～〜]+\s*$", title)
                  or re.match(r"^(.*?)\s+(?:[-–—]|:)\s+.+$", title))
         if not match or len(normal(match.group(1))) < 3:
             return None
         removed = unicodedata.normalize("NFKC", title[len(match.group(1)):]).replace("~", " ").replace("～", " ").replace("〜", " ")
-        if (season_of(removed) or re.search(r"\b(?:[A-Z]|[IVX]{2,4}|OVA|OAD|SP|Part|Cour)\b|극장판|특별편", removed, re.I)):
+        if _has_title_identity(removed):
             return None
         return match.group(1).strip()
 
@@ -102,6 +108,40 @@ def title_queries(subject: str, aliases=()) -> list[str]:
     for alias in titles[1:]:
         queries.extend((alias, shortened(alias)))
     return list(dict.fromkeys(query for query in queries if query))[:3]
+
+
+def blog_title_alias(post: str, aliases: list[str], season: int | None = None) -> str | None:
+    """Confirm a shorter title using the work's registered creator post.
+
+    Only a complete post title that is a prefix of a known title qualifies;
+    arbitrary shared words and partial words do not establish a work's identity.
+    """
+    title = unicodedata.normalize("NFKC", post)
+    title = re.sub(r"^\s*\[(?:자막|Erai-raws|Ohys-Raws|SubsPlease|Moozzi2|Snow-Raws)\]\s*",
+                   "", title, flags=re.I)
+    title = re.split(
+        r"(?:\d{1,3}\s*[~～〜\-–]\s*)?\d{1,3}\s*(?:화|話|회)"
+        r"|\bS\d{1,2}[ ._-]*E\d{1,3}\b|자막", title, maxsplit=1, flags=re.I)[0]
+    title = _without_known_title_notes(title, aliases).strip()
+    title = re.sub(r"\s*[\[(](?:完|완결|END)[\])]\s*$", "", title, flags=re.I)
+    title = re.sub(r"(?:\s+(?:BD|TV|블루레이|전체|통합|완결|한글|한국어))+$", "", title, flags=re.I)
+    title = title.strip(" \t\r\n-–—:~～〜")
+    normalized = normal(title)
+    if len(normalized) < 4 or (season and season > 1 and season_of(title) != season):
+        return None
+    for alias in aliases:
+        known = unicodedata.normalize("NFKC", alias)
+        value = normal(known)
+        if not value.startswith(normalized) or value == normalized:
+            continue
+        positions = [index for index, character in enumerate(known) if character.isalnum()]
+        remainder = known[positions[len(normalized) - 1] + 1:]
+        if remainder[:1].isalnum() or _has_title_identity(remainder):
+            continue
+        if season_of(title) != season_of(known) or is_special(title) != is_special(known):
+            continue
+        return title
+    return None
 
 
 def _without_known_title_notes(title: str, aliases: list[str]) -> str:

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from subfinder.gui import App
-from subfinder.models import Candidate, Query, SearchResult
+from subfinder.models import Anime, AnimeSearchResult, Candidate, Query, SearchResult
 
 
 class SearchControlsTests(unittest.TestCase):
@@ -145,6 +145,49 @@ class SearchControlsTests(unittest.TestCase):
             self.app._candidate_context_menu(SimpleNamespace(y=20, x_root=30, y_root=40))
         self.assertEqual(self.app.tree.selection(), ("1",))
         popup.assert_called_once_with(30, 40)
+
+    def test_anime_context_menu_selects_clicked_work_and_opens_anissia(self):
+        self.app.anime_results = AnimeSearchResult([
+            Anime(12, "예시 작품"), Anime(3435, "아가씨 돌보기")], status="found")
+        self.app._populate_anime()
+        self.app.anime_tree.selection_set("12")
+        self.assertTrue(self.app.anime_tree.bind("<Button-3>"))
+        self.assertEqual(self.app.anime_menu.entrycget(0, "label"), "애니시아에서 보기")
+        with patch.object(self.app.anime_tree, "identify_row", return_value="3435"), \
+                patch.object(self.app.anime_menu, "tk_popup") as popup, \
+                patch("subfinder.gui.webbrowser.open") as open_browser:
+            self.app._anime_context_menu(SimpleNamespace(y=20, x_root=30, y_root=40))
+            self.assertEqual(self.app.anime_tree.selection(), ("3435",))
+            self.assertEqual(self.app.anime_tree.focus(), "3435")
+            popup.assert_called_once_with(30, 40)
+            open_browser.assert_not_called()
+            self.app.anime_menu.invoke(0)
+            open_browser.assert_called_once_with("https://anissia.net/anime?animeNo=3435")
+
+    def test_anime_context_menu_ignores_blank_and_unknown_rows(self):
+        self.app.anime_results = AnimeSearchResult([Anime(3435, "아가씨 돌보기")])
+        self.app._populate_anime()
+        self.app.anime_tree.selection_set("3435")
+        for row in ("", "9999"):
+            with self.subTest(row=row), \
+                    patch.object(self.app.anime_tree, "identify_row", return_value=row), \
+                    patch.object(self.app.anime_menu, "tk_popup") as popup, \
+                    patch("subfinder.gui.webbrowser.open") as open_browser:
+                self.app._anime_context_menu(SimpleNamespace(y=20, x_root=30, y_root=40))
+                self.assertEqual(self.app.anime_tree.selection(), ("3435",))
+                popup.assert_not_called()
+                open_browser.assert_not_called()
+
+    def test_anissia_open_ignores_missing_stale_and_invalid_selections(self):
+        with patch("subfinder.gui.webbrowser.open") as open_browser:
+            self.app.open_anissia()
+            self.app.anime_results = AnimeSearchResult([Anime(0, "잘못된 작품")])
+            self.app._populate_anime()
+            self.app.anime_tree.selection_set("0")
+            self.app.open_anissia()
+            self.app.anime_results = AnimeSearchResult()
+            self.app.open_anissia()
+            open_browser.assert_not_called()
 
     def test_download_failure_is_shown_in_dialog(self):
         self.app.events.put((self.app.generation, "error", ("다운로드 실패", "자막 대신 웹페이지를 받음")))

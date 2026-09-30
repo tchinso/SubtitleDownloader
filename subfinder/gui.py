@@ -125,6 +125,9 @@ class App:
         self.anime_tree.bind("<<TreeviewSelect>>", self._select_anime)
         self.anime_tree.bind("<Double-1>", lambda _: self.search_selected())
         self.anime_tree.bind("<Return>", lambda _: self.search_selected())
+        self.anime_tree.bind("<Button-3>", self._anime_context_menu)
+        self.anime_menu = tk.Menu(self.root, tearoff=False)
+        self.anime_menu.add_command(label="애니시아에서 보기", command=self.open_anissia)
 
         ttk.Label(self.root, text="자막 후보 (더블클릭 또는 우클릭으로 다운로드)", padding=(12, 0, 12, 0)).pack(anchor="w")
         columns = ("source", "title", "episode", "lang", "file", "match")
@@ -250,6 +253,26 @@ class App:
             return
         self._run(f"{anime.subject} 제작자 블로그 확인 중…",
                   lambda: ("blogs", self.reanime.creator_blogs(anime)))
+
+    def _anime_context_menu(self, event):
+        row = self.anime_tree.identify_row(event.y)
+        if not any(str(anime.anime_no) == row and anime.anime_no > 0
+                   for anime in self.anime_results.anime):
+            return
+        self.anime_tree.selection_set(row)
+        self.anime_tree.focus(row)
+        self._select_anime()
+        try:
+            self.anime_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.anime_menu.grab_release()
+
+    def open_anissia(self):
+        selected = self.anime_tree.selection()
+        anime = next((item for item in self.anime_results.anime
+                      if selected and str(item.anime_no) == selected[0]), None)
+        if anime is not None and anime.anime_no > 0:
+            webbrowser.open(f"https://anissia.net/anime?animeNo={anime.anime_no}")
 
     def _show_creator_blogs(self, blogs: list[CreatorBlog]):
         if not blogs:
