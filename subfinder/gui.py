@@ -59,17 +59,27 @@ class App:
         ttk.Label(top, text="애니 제목").grid(row=0, column=0, sticky="w")
         self.title = tk.StringVar()
         self.title_entry = ttk.Entry(top, textvariable=self.title)
-        self.title_entry.grid(row=0, column=1, columnspan=5, sticky="ew", padx=6)
+        self.title_entry.grid(row=0, column=1, columnspan=3, sticky="ew", padx=6)
         self.title_entry.bind("<Return>", lambda _: self.search())
-        ttk.Label(top, text="시즌").grid(row=1, column=0, sticky="w", pady=8)
-        self.season = tk.StringVar()
-        ttk.Entry(top, width=8, textvariable=self.season).grid(row=1, column=1, sticky="w", padx=6)
-        ttk.Label(top, text="화수").grid(row=1, column=2, sticky="e")
+        ttk.Label(top, text="영문 제목").grid(row=1, column=0, sticky="w", pady=8)
+        self.english_title = tk.StringVar()
+        self.english_title_entry = ttk.Entry(top, textvariable=self.english_title)
+        self.english_title_entry.grid(row=1, column=1, columnspan=3, sticky="ew", padx=6)
+        self.english_title_placeholder = ttk.Label(
+            self.english_title_entry,
+            text="애니시아 검색 시 필요없음, 가급적 로마자 표기 우선 예: 귀멸의 칼날→kimetsu no yaiba",
+            foreground="#888888",
+            background=ttk.Style(self.root).lookup("TEntry", "fieldbackground") or "white",
+        )
+        self.english_title_placeholder.bind("<Button-1>", lambda _: self.english_title_entry.focus_set())
+        self.english_title.trace_add("write", self._update_english_title_placeholder)
+        self._update_english_title_placeholder()
+        ttk.Label(top, text="화수").grid(row=2, column=0, sticky="w")
         self.episode = tk.StringVar()
-        ttk.Entry(top, width=8, textvariable=self.episode).grid(row=1, column=3, sticky="w", padx=6)
-        ttk.Label(top, text="OpenSubtitles 언어").grid(row=1, column=4, sticky="e")
+        ttk.Entry(top, width=8, textvariable=self.episode).grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Label(top, text="OpenSubtitles 언어").grid(row=2, column=2, sticky="e")
         self.language = tk.StringVar(value="ko")
-        ttk.Combobox(top, textvariable=self.language, width=9, values=("ko", "ja", "en", "zh", "es", "fr", "de"), state="readonly").grid(row=1, column=5, sticky="w", padx=6)
+        ttk.Combobox(top, textvariable=self.language, width=9, values=("ko", "ja", "en", "zh", "es", "fr", "de"), state="readonly").grid(row=2, column=3, sticky="w", padx=6)
         top.columnconfigure(1, weight=1)
         actions = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         actions.pack(fill="x")
@@ -152,20 +162,31 @@ class App:
         ttk.Button(other_sources, text="선택 원문 열기", command=self.open_source).pack(side="left")
         ttk.Label(other_sources, text="Bigfile 자막은 로그인 없이 검색할 수 있으며, 다운로드에는 로그인이 필요합니다.").pack(side="left", padx=12)
 
+    def _update_english_title_placeholder(self, *_args):
+        if self.english_title.get():
+            self.english_title_placeholder.place_forget()
+        else:
+            self.english_title_placeholder.place(x=5, rely=0.5, anchor="w")
+
+    def _english_query(self, language_override: str | None = None) -> Query | None:
+        title = self.english_title.get().strip()
+        if not title:
+            messagebox.showinfo("영문 제목", "Bigfile·OpenSubtitles 검색에 사용할 영문 또는 로마자 제목을 입력해 줘")
+            self.english_title_entry.focus_set()
+            return None
+        return self._query(title_override=title, language_override=language_override)
+
     def _query(self, title_override: str | None = None, language_override: str | None = None) -> Query | None:
         title = (title_override if title_override is not None else self.title.get()).strip()
         if not title:
             messagebox.showinfo("작품명", "애니 제목을 먼저 입력해 줘")
             return None
-        fields = []
-        for label, variable in (("시즌", self.season), ("화수", self.episode)):
-            value = variable.get().strip()
-            if value and (not value.isdecimal() or not 1 <= int(value) <= 999):
-                messagebox.showerror("입력 오류", f"{label}는 1~999 숫자로 입력해 줘")
-                return None
-            fields.append(int(value) if value else None)
+        value = self.episode.get().strip()
+        if value and (not value.isdecimal() or not 1 <= int(value) <= 999):
+            messagebox.showerror("입력 오류", "화수는 1~999 숫자로 입력해 줘")
+            return None
         language = language_override or self.language.get()
-        return Query(title=title, language=language, season=fields[0], episode=fields[1])
+        return Query(title=title, language=language, episode=int(value) if value else None)
 
     def _run(self, message: str, task, error_title: str = ""):
         if self.busy:
@@ -280,13 +301,7 @@ class App:
     def search_open(self):
         if self.busy:
             return
-        entered = self.title.get().strip()
-        initial = entered if entered.isascii() and any("a" <= c.lower() <= "z" for c in entered) else ""
-        english = simpledialog.askstring("OpenSubtitles 검색", "검색할 작품의 영문 제목을 입력해 줘.",
-                                         initialvalue=initial, parent=self.root)
-        if english is None:
-            return
-        query = self._query(title_override=english)
+        query = self._english_query()
         if not query:
             return
         self.current_query = query
@@ -295,13 +310,7 @@ class App:
     def search_bigfile(self):
         if self.busy:
             return
-        entered = self.title.get().strip()
-        initial = entered if entered.isascii() and any("a" <= c.lower() <= "z" for c in entered) else ""
-        english = simpledialog.askstring("Bigfile 애니 검색", "검색할 작품의 영문 제목을 입력해 줘.",
-                                         initialvalue=initial, parent=self.root)
-        if english is None:
-            return
-        query = self._query(title_override=english, language_override="ko")
+        query = self._english_query(language_override="ko")
         if query is None:
             return
         self.current_query = query

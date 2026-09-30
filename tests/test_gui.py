@@ -26,6 +26,7 @@ class SearchControlsTests(unittest.TestCase):
         self.assertEqual(self.app.open_button.cget("text"), "OpenSubtitles 검색 (영문)")
 
         self.app.title.set("책벌레의 하극상")
+        self.assertEqual(self.app.english_title.get(), "")
         self.app.language.set("en")
         with patch.object(self.app, "_run") as run, patch.object(self.app.reanime, "discover") as discover:
             self.app.search()
@@ -42,27 +43,31 @@ class SearchControlsTests(unittest.TestCase):
 
     def test_opensubtitles_uses_english_title_without_merging_previous_results(self):
         self.app.title.set("책벌레의 하극상")
+        self.app.english_title.set("  Ascendance of a Bookworm  ")
         self.app.episode.set("22")
         self.app.language.set("en")
         self.app.results = SearchResult([Candidate("ReAnime", "old", "old.ass", "https://example.com")])
-        with patch("subfinder.gui.simpledialog.askstring", return_value="Ascendance of a Bookworm"), \
+        with patch("subfinder.gui.simpledialog.askstring") as ask_title, \
                 patch.object(self.app, "_run") as run, \
                 patch.object(self.app.engine, "search_open", return_value=SearchResult()) as search_open:
             self.app.search_open()
             self.assertEqual(run.call_args.args[1]()[0], "search")
             search_open.assert_called_once_with(Query("Ascendance of a Bookworm", language="en", episode=22))
+            ask_title.assert_not_called()
         self.assertEqual(self.app.title.get(), "책벌레의 하극상")
 
     def test_bigfile_uses_english_title_and_opens_login_site_for_download(self):
         self.app.title.set("책벌레의 하극상")
+        self.app.english_title.set("Honzuki no Gekokujou")
         self.app.episode.set("22")
-        with patch("subfinder.gui.simpledialog.askstring", return_value="Ascendance of a Bookworm"), \
+        with patch("subfinder.gui.simpledialog.askstring") as ask_title, \
                 patch.object(self.app, "_run") as run, \
                 patch.object(self.app.engine, "search_bigfile", return_value=SearchResult()) as search_bigfile:
             self.app.search_bigfile()
             self.assertEqual(run.call_args.args[1]()[0], "search")
             search_bigfile.assert_called_once_with(self.app.current_query)
-        self.assertEqual(self.app.current_query, Query("Ascendance of a Bookworm", episode=22))
+            ask_title.assert_not_called()
+        self.assertEqual(self.app.current_query, Query("Honzuki no Gekokujou", episode=22))
         self.assertEqual(self.app.title.get(), "책벌레의 하극상")
         candidate = Candidate("Bigfile", "Ascendance of a Bookworm", "Bookworm 22.smi",
                               "https://www.bigfile.co.kr/content/freecaption.php?cateGory=0005")
@@ -74,6 +79,45 @@ class SearchControlsTests(unittest.TestCase):
             self.app.download()
         open_browser.assert_called_once_with(candidate.source_url)
         download.assert_not_called()
+
+    def test_english_searches_work_without_korean_title_or_season_filter(self):
+        self.app.english_title.set("kimetsu no yaiba")
+        self.app.language.set("ja")
+        for action, method, language in ((self.app.search_bigfile, "search_bigfile", "ko"),
+                                         (self.app.search_open, "search_open", "ja")):
+            with self.subTest(provider=method), patch.object(self.app, "_run") as run, \
+                    patch.object(self.app.engine, method, return_value=SearchResult()) as search:
+                action()
+                run.call_args.args[1]()
+                search.assert_called_once_with(Query("kimetsu no yaiba", language=language))
+
+    def test_empty_english_title_does_not_search_korean_title_or_placeholder(self):
+        self.app.title.set("귀멸의 칼날")
+        for value in ("", "   "):
+            self.app.english_title.set(value)
+            for action in (self.app.search_bigfile, self.app.search_open):
+                with self.subTest(value=value, action=action.__name__), \
+                        patch("subfinder.gui.messagebox.showinfo") as info, \
+                        patch("subfinder.gui.simpledialog.askstring") as ask_title, \
+                        patch.object(self.app, "_run") as run:
+                    action()
+                    info.assert_called_once()
+                    ask_title.assert_not_called()
+                    run.assert_not_called()
+
+    def test_english_placeholder_disappears_on_typing_and_returns_when_cleared(self):
+        placeholder = self.app.english_title_placeholder
+        entry = self.app.english_title_entry
+        self.assertEqual(entry.get(), "")
+        self.assertEqual(placeholder.winfo_manager(), "place")
+        self.assertEqual(placeholder.cget("text"),
+                         "애니시아 검색 시 필요없음, 가급적 로마자 표기 우선 예: 귀멸의 칼날→kimetsu no yaiba")
+        entry.insert(0, "k")
+        self.assertEqual(self.app.english_title.get(), "k")
+        self.assertEqual(placeholder.winfo_manager(), "")
+        entry.delete(0, tk.END)
+        self.assertEqual(self.app.english_title.get(), "")
+        self.assertEqual(placeholder.winfo_manager(), "place")
 
     def test_subtitle_double_click_downloads_clicked_row(self):
         self.app.current_query = Query("예시")

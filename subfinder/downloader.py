@@ -8,10 +8,12 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, unquote_to_bytes, urlencode, urlsplit
 import zipfile
+import zlib
 
 from .matching import (ARCHIVES, FORMATS, drive_id, file_name_from_url,
                        filename_episode, is_special)
@@ -22,6 +24,62 @@ from .providers.opensubtitles import OpenSubtitles
 
 FILE_LIMIT = 6 * 1024 * 1024
 SINGLE_LIMIT = 5 * 1024 * 1024
+
+
+def _decode_filename_bytes(raw: bytes, original: str) -> str:
+    """Recover UTF-8 or Korean legacy bytes without replacing valid characters."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            decoded = raw.decode("cp949")
+        except UnicodeDecodeError:
+            return original
+        # CP949's extension maps accent + ASCII byte pairs to Hangul too.
+        # Require a standard EUC-KR Hangul pair to avoid corrupting names such
+        # as CP437 "école" while accepting mixed CP949 Korean filenames.
+        for character in decoded:
+            if "가" <= character <= "힣":
+                pair = character.encode("cp949")
+                if len(pair) == 2 and 0xB0 <= pair[0] <= 0xC8 and 0xA1 <= pair[1] <= 0xFE:
+                    return decoded
+        return original
+
+
+def _readable_filename(value: str) -> str:
+    # Some attachment servers percent-encode filename= rather than filename*=.
+    if re.search(r"%[0-9a-fA-F]{2}", value):
+        value = _decode_filename_bytes(unquote_to_bytes(value), value)
+    # HTTP headers expose raw non-ASCII bytes as Latin-1 through urllib.
+    try:
+        raw = value.encode("latin-1")
+    except UnicodeEncodeError:
+        return value
+    return _decode_filename_bytes(raw, value)
+
+
+def _zip_filename(info: zipfile.ZipInfo) -> str:
+    if info.flag_bits & 0x800:
+        return info.filename
+    try:
+        raw = info.orig_filename.encode("cp437")
+    except UnicodeEncodeError:
+        return info.filename
+    # Older Python versions ignore the Info-ZIP Unicode path extra field.
+    # Honor it only when its CRC proves it belongs to this stored filename.
+    extra = info.extra
+    while len(extra) >= 4:
+        tag, size = struct.unpack_from("<HH", extra)
+        field, extra = extra[4:4 + size], extra[4 + size:]
+        if len(field) != size:
+            break
+        if (tag == 0x7075 and len(field) >= 5 and field[0] == 1
+                and struct.unpack_from("<I", field, 1)[0] == zlib.crc32(raw)):
+            try:
+                return field[5:].decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+    return _decode_filename_bytes(raw, info.filename)
 
 
 def safe_name(value: str, fallback: str = "subtitle") -> str:
@@ -64,8 +122,9 @@ def _zip_selection(data: bytes, episode: int | None, allow_special: bool = False
         for info in items:
             if info.is_dir() or info.file_size > SINGLE_LIMIT or info.flag_bits & 1:
                 continue
-            name = PurePosixPath(info.filename.replace("\\", "/")).name
-            if (name and not name.startswith(".") and "__MACOSX" not in info.filename
+            member_name = _zip_filename(info)
+            name = PurePosixPath(member_name.replace("\\", "/")).name
+            if (name and not name.startswith(".") and "__MACOSX" not in member_name
                     and Path(name).suffix.lower() in FORMATS
                     and (allow_special or not is_special(name))):
                 choices.append((info, name))
@@ -98,7 +157,7 @@ def _seven_zip_selection(data: bytes, suffix: str, episode: int | None,
     with tempfile.TemporaryDirectory(prefix="subtitle-archive-") as folder:
         path = Path(folder) / ("source" + suffix)
         path.write_bytes(data)
-        listing = subprocess.run([binary, "l", "-slt", "-bd", str(path)], capture_output=True, timeout=20)
+        listing = subprocess.run([binary, "l", "-slt", "-bd", "-sccUTF-8", str(path)], capture_output=True, timeout=20)
         if listing.returncode or len(listing.stdout) > 2 * 1024 * 1024:
             raise SourceError("7-Zip 목록을 확인하지 못함")
         entries = re.split(r"\r?\n\r?\n", listing.stdout.decode("utf-8", errors="replace"))
@@ -138,11 +197,21 @@ def _disposition_name(headers: dict[str, str]) -> str:
         return ""
     msg = Message()
     msg["content-disposition"] = raw
-    value = msg.get_param("filename", header="content-disposition")
-    if isinstance(value, tuple):
-        from email.utils import collapse_rfc2231_value
-        return collapse_rfc2231_value(value)
-    return str(value or "")
+    values = [value for key, value in (msg.get_params(header="content-disposition") or [])
+              if key.lower() == "filename"]
+    # RFC 6266 gives filename* priority over the ASCII filename fallback.
+    for value in sorted(values, key=lambda value: not isinstance(value, tuple)):
+        if isinstance(value, tuple):
+            charset, _, encoded = value
+            try:
+                value = encoded.encode("latin-1").decode(charset or "utf-8")
+            except (LookupError, UnicodeError):
+                continue
+            if value:
+                return value  # filename* has already been percent-decoded.
+        if value:
+            return _readable_filename(str(value))
+    return ""
 
 
 class Downloader:
@@ -190,6 +259,7 @@ class Downloader:
         source_episode = candidate.source_episode if candidate.source_episode is not None else requested_episode
         if candidate.file_id is not None:
             data, name = self.opensubtitles.download(candidate)
+            name = _readable_filename(name)
         else:
             if not candidate.download_url or not allowed_url(candidate.download_url):
                 raise SourceError("다운로드 링크가 허용되지 않음")
@@ -199,7 +269,8 @@ class Downloader:
             if "text/html" in content_type:
                 raise SourceError("자막 대신 웹페이지를 받음. 원문에서 공개 설정을 확인해 줘")
             data = response.body
-            name = _disposition_name(response.headers) or candidate.file_name or file_name_from_url(response.url)
+            name = (_disposition_name(response.headers)
+                    or _readable_filename(candidate.file_name or file_name_from_url(response.url)))
         if not data or len(data) > FILE_LIMIT:
             raise SourceError("빈 파일 또는 크기 제한 초과")
         suffix = _extension(data, name)
