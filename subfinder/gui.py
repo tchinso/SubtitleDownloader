@@ -74,12 +74,11 @@ class App:
         self.english_title_placeholder.bind("<Button-1>", lambda _: self.english_title_entry.focus_set())
         self.english_title.trace_add("write", self._update_english_title_placeholder)
         self._update_english_title_placeholder()
-        ttk.Label(top, text="화수").grid(row=2, column=0, sticky="w")
-        self.episode = tk.StringVar()
-        ttk.Entry(top, width=8, textvariable=self.episode).grid(row=2, column=1, sticky="w", padx=6)
-        ttk.Label(top, text="OpenSubtitles 언어").grid(row=2, column=2, sticky="e")
+        language_frame = ttk.Frame(top)
+        language_frame.grid(row=2, column=0, columnspan=4, sticky="w")
+        ttk.Label(language_frame, text="OpenSubtitles 언어").pack(side="left")
         self.language = tk.StringVar(value="ko")
-        ttk.Combobox(top, textvariable=self.language, width=9, values=("ko", "ja", "en", "zh", "es", "fr", "de"), state="readonly").grid(row=2, column=3, sticky="w", padx=6)
+        ttk.Combobox(language_frame, textvariable=self.language, width=9, values=("ko", "ja", "en", "zh", "es", "fr", "de"), state="readonly").pack(side="left", padx=6)
         top.columnconfigure(1, weight=1)
         actions = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         actions.pack(fill="x")
@@ -181,12 +180,8 @@ class App:
         if not title:
             messagebox.showinfo("작품명", "애니 제목을 먼저 입력해 줘")
             return None
-        value = self.episode.get().strip()
-        if value and (not value.isdecimal() or not 1 <= int(value) <= 999):
-            messagebox.showerror("입력 오류", "화수는 1~999 숫자로 입력해 줘")
-            return None
         language = language_override or self.language.get()
-        return Query(title=title, language=language, episode=int(value) if value else None)
+        return Query(title=title, language=language)
 
     def _run(self, message: str, task, error_title: str = ""):
         if self.busy:
@@ -239,7 +234,7 @@ class App:
         query = self._query(language_override="ko")
         if query is None:
             return
-        query = Query(anime.subject, query.language, query.season, query.episode)
+        query = Query(title=anime.subject, language=query.language)
         self.title.set(anime.subject)
         self.current_query = query
         self._run(f"{anime.subject} 자막 검색 중…", lambda: ("search", self.engine.search_selected(query, anime)))

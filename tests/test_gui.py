@@ -35,8 +35,7 @@ class SearchControlsTests(unittest.TestCase):
 
     def test_google_search_opens_only_when_user_asks(self):
         self.app.title.set("선택 작품")
-        self.app.episode.set("7")
-        expected = "https://www.google.com/search?hl=ko&q=%EC%84%A0%ED%83%9D+%EC%9E%91%ED%92%88+7%ED%99%94+%EC%9E%90%EB%A7%89"
+        expected = "https://www.google.com/search?hl=ko&q=%EC%84%A0%ED%83%9D+%EC%9E%91%ED%92%88+%EC%9E%90%EB%A7%89"
         with patch("subfinder.gui.webbrowser.open") as open_browser:
             self.app.google_open()
             open_browser.assert_called_once_with(expected)
@@ -44,7 +43,6 @@ class SearchControlsTests(unittest.TestCase):
     def test_opensubtitles_uses_english_title_without_merging_previous_results(self):
         self.app.title.set("책벌레의 하극상")
         self.app.english_title.set("  Ascendance of a Bookworm  ")
-        self.app.episode.set("22")
         self.app.language.set("en")
         self.app.results = SearchResult([Candidate("ReAnime", "old", "old.ass", "https://example.com")])
         with patch("subfinder.gui.simpledialog.askstring") as ask_title, \
@@ -52,14 +50,13 @@ class SearchControlsTests(unittest.TestCase):
                 patch.object(self.app.engine, "search_open", return_value=SearchResult()) as search_open:
             self.app.search_open()
             self.assertEqual(run.call_args.args[1]()[0], "search")
-            search_open.assert_called_once_with(Query("Ascendance of a Bookworm", language="en", episode=22))
+            search_open.assert_called_once_with(Query("Ascendance of a Bookworm", language="en"))
             ask_title.assert_not_called()
         self.assertEqual(self.app.title.get(), "책벌레의 하극상")
 
     def test_bigfile_uses_english_title_and_opens_login_site_for_download(self):
         self.app.title.set("책벌레의 하극상")
         self.app.english_title.set("Honzuki no Gekokujou")
-        self.app.episode.set("22")
         with patch("subfinder.gui.simpledialog.askstring") as ask_title, \
                 patch.object(self.app, "_run") as run, \
                 patch.object(self.app.engine, "search_bigfile", return_value=SearchResult()) as search_bigfile:
@@ -67,7 +64,7 @@ class SearchControlsTests(unittest.TestCase):
             self.assertEqual(run.call_args.args[1]()[0], "search")
             search_bigfile.assert_called_once_with(self.app.current_query)
             ask_title.assert_not_called()
-        self.assertEqual(self.app.current_query, Query("Honzuki no Gekokujou", episode=22))
+        self.assertEqual(self.app.current_query, Query("Honzuki no Gekokujou"))
         self.assertEqual(self.app.title.get(), "책벌레의 하극상")
         candidate = Candidate("Bigfile", "Ascendance of a Bookworm", "Bookworm 22.smi",
                               "https://www.bigfile.co.kr/content/freecaption.php?cateGory=0005")
@@ -80,7 +77,7 @@ class SearchControlsTests(unittest.TestCase):
         open_browser.assert_called_once_with(candidate.source_url)
         download.assert_not_called()
 
-    def test_english_searches_work_without_korean_title_or_season_filter(self):
+    def test_english_searches_work_without_korean_title_or_episode_filters(self):
         self.app.english_title.set("kimetsu no yaiba")
         self.app.language.set("ja")
         for action, method, language in ((self.app.search_bigfile, "search_bigfile", "ko"),
